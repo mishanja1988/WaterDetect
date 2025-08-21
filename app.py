@@ -18,7 +18,7 @@ from plotly.subplots import make_subplots
 # Глобальные настройки
 # =========================
 EPS = 1e-9
-TEMPLATE_PATH = "/mnt/data/Сосновское_clean.xlsx"  # новый шаблон из вложения
+TEMPLATE_PATH = "data/templates/Сосновское_clean.xlsx"  # новый шаблон из вложения
 
 st.set_page_config(
     layout='wide',
@@ -533,3 +533,4 @@ def show():
 # =========================
 if __name__ == '__main__':
     show()
+
