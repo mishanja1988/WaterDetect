@@ -450,7 +450,7 @@ def show():
             ax2.set_ylabel('dWOR/dt')
             ax2.plot(ch_g['t_pos'], ch_g['dWOR_dt'], label='dWOR/dt', linestyle='--')
             ax2.set_xscale('log') # Set x-axis to logarithmic scale
-            # ax2.set_yscale('log') # Do not set y-axis to logarithmic scale for derivative
+            ax2.set_yscale('log') # Do not set y-axis to logarithmic scale for derivative
             lines, labels = ax1.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
             ax2.legend(lines + lines2, labels + labels2, loc='upper left')
@@ -494,3 +494,4 @@ def upload_result(df_MG, df_Chan):
 if __name__ == '__main__':
 
     show()
+
