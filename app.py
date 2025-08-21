@@ -1,5 +1,5 @@
 # app.py — Автодиагностика скважин (всё в одном файле)
-# ----------------------------------------------------
+
 from __future__ import annotations
 
 import os
@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
+from PIL import Image as PILImage  # используется в openpyxl-фоллбеке
 
 # =========================
 # Глобальные настройки
@@ -28,16 +29,26 @@ st.set_page_config(
 )
 
 st.write("### Поскважинный автодиагноз нефтяных скважин по механизму обводнения")
-st.markdown(
-    """
+
+DESCRIPTION_MD = """
 **Суть работы:** проведение расчётно-аналитического автодиагноза механизма обводнения по методикам Чена (Chan) и Меркуловой–Гинзбурга (MG) на основе пользовательских исходных данных.
 
-**Что необходимо сделать:**  
-1) Скачать шаблон исходных данных, 2) заполнить, 3) загрузить,  
-4) получить текстовый и визуальный диагноз по каждой скважине,  
-5) скачать **единый Excel** с таблицами и графиками.
+**Что необходимо сделать:**
+1. Скачать шаблон исходных данных;
+2. Заполнить шаблон своими данными;
+3. Загрузить файл в окно подгрузки;
+4. Получить текстовый и визуальный диагноз по каждой скважине;
+5. Скачать единый Excel c таблицами и графиками.
+
+**Добавленные столбцы:**
+* `Well_calc = H + " " + I`
+* `Добыча нефти м3/мес = X * (100 - AB) / 100`
+* `Добыча воды м3/мес = X * AB / 100`
+* `ВНФ = BT / BS`
+* `Накопленное время работы = ЕСЛИ(BR[i]==BR[i-1]; AJ[i] + cum[i-1]; AJ[i])`
+* `ВНФ'` — производная по «Накопленному времени»
 """
-)
+st.markdown(DESCRIPTION_MD)
 
 # =========================
 # Утилиты
@@ -400,7 +411,7 @@ def diagnose_chan_group(g: pd.DataFrame) -> Dict[str, str]:
     return {"chan_text": "; ".join(parts), "chan_detail": detail}
 
 # =========================
-# Экспорт «всё в один Excel» с картинками
+# Экспорт «всё в один Excel» с картинками (+ фоллбек)
 # =========================
 def _render_plot_image(kind: str, g: pd.DataFrame, well: str) -> BytesIO:
     """Сгенерировать matplotlib-график в PNG (в памяти)."""
@@ -429,65 +440,142 @@ def _render_plot_image(kind: str, g: pd.DataFrame, well: str) -> BytesIO:
     buf.seek(0)
     return buf
 
-def export_all_results_single_file(
-    mg_df: pd.DataFrame, chan_df: pd.DataFrame, diagnosis_df: pd.DataFrame
-) -> BytesIO:
+def export_all_results_single_file(mg_df: pd.DataFrame,
+                                   chan_df: pd.DataFrame,
+                                   diagnosis_df: pd.DataFrame) -> BytesIO:
     """
-    Итоговый XLSX:
-      - Summary: diagnosis_df
-      - MG: блоки по скважинам (таблица + график справа)
-      - Chan: блоки по скважинам (таблица + график справа)
+    Итоговый XLSX с тремя листами:
+      - Summary: сводная таблица диагнозов
+      - MG: по каждой скважине — таблица + картинка справа
+      - Chan: по каждой скважине — таблица + картинка справа
+
+    Если есть xlsxwriter — используем его.
+    Иначе — фоллбек на openpyxl (картинки вставляются тоже).
     """
+    # Попробуем xlsxwriter
+    try:
+        import xlsxwriter  # noqa: F401
+        return _export_with_xlsxwriter(mg_df, chan_df, diagnosis_df)
+    except Exception:
+        # Фоллбек: openpyxl
+        return _export_with_openpyxl(mg_df, chan_df, diagnosis_df)
+
+def _export_with_xlsxwriter(mg_df: pd.DataFrame,
+                            chan_df: pd.DataFrame,
+                            diagnosis_df: pd.DataFrame) -> BytesIO:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         # Summary
         if diagnosis_df is not None and not diagnosis_df.empty:
             diagnosis_df.to_excel(writer, sheet_name="Summary", index=False)
-            writer.sheets["Summary"].set_column(0, diagnosis_df.shape[1] - 1, 18)
+            writer.sheets["Summary"].set_column(0, diagnosis_df.shape[1]-1, 18)
         else:
             ws = writer.book.add_worksheet("Summary")
             ws.write(0, 0, "Нет сводных диагнозов")
 
         # MG
-        ws_mg = writer.book.add_worksheet("MG")
-        writer.sheets["MG"] = ws_mg
-        cur_row = 0
+        ws_mg = writer.book.add_worksheet("MG"); writer.sheets["MG"] = ws_mg
+        cur = 0
         if mg_df is not None and not mg_df.empty:
             for well, g in mg_df.groupby("well", sort=False):
                 title = f"Скважина {well} — MG"
                 g_reset = g.reset_index(drop=True)
-                g_reset.to_excel(writer, sheet_name="MG", index=False, startrow=cur_row + 1, startcol=0)
-                ws_mg.write(cur_row, 0, title)
-                ws_mg.set_column(0, min(8, g_reset.shape[1] - 1), 14)
-                if g_reset.shape[1] > 9:
-                    ws_mg.set_column(9, g_reset.shape[1] - 1, 16)
+                g_reset.to_excel(writer, sheet_name="MG", index=False, startrow=cur+1, startcol=0)
+                ws_mg.write(cur, 0, title)
+                ws_mg.set_column(0, min(8, g_reset.shape[1]-1), 14)
+                if g_reset.shape[1] > 9: ws_mg.set_column(9, g_reset.shape[1]-1, 16)
                 img = _render_plot_image("MG", g, well)
-                ws_mg.insert_image(cur_row + 1, 9, f"MG_{well}.png", {"image_data": img})
-                cur_row = cur_row + 1 + len(g_reset) + 4
+                ws_mg.insert_image(cur+1, 9, f"MG_{well}.png", {"image_data": img})
+                cur = cur + 1 + len(g_reset) + 4
         else:
             ws_mg.write(0, 0, "Нет данных MG")
 
         # Chan
-        ws_ch = writer.book.add_worksheet("Chan")
-        writer.sheets["Chan"] = ws_ch
-        cur_row = 0
+        ws_ch = writer.book.add_worksheet("Chan"); writer.sheets["Chan"] = ws_ch
+        cur = 0
         if chan_df is not None and not chan_df.empty:
             for well, g in chan_df.groupby("well", sort=False):
                 title = f"Скважина {well} — Chan"
                 g_reset = g.reset_index(drop=True)
-                g_reset.to_excel(writer, sheet_name="Chan", index=False, startrow=cur_row + 1, startcol=0)
-                ws_ch.write(cur_row, 0, title)
-                ws_ch.set_column(0, min(8, g_reset.shape[1] - 1), 14)
-                if g_reset.shape[1] > 9:
-                    ws_ch.set_column(9, g_reset.shape[1] - 1, 16)
+                g_reset.to_excel(writer, sheet_name="Chan", index=False, startrow=cur+1, startcol=0)
+                ws_ch.write(cur, 0, title)
+                ws_ch.set_column(0, min(8, g_reset.shape[1]-1), 14)
+                if g_reset.shape[1] > 9: ws_ch.set_column(9, g_reset.shape[1]-1, 16)
                 img = _render_plot_image("Chan", g, well)
-                ws_ch.insert_image(cur_row + 1, 9, f"Chan_{well}.png", {"image_data": img})
-                cur_row = cur_row + 1 + len(g_reset) + 4
+                ws_ch.insert_image(cur+1, 9, f"Chan_{well}.png", {"image_data": img})
+                cur = cur + 1 + len(g_reset) + 4
         else:
             ws_ch.write(0, 0, "Нет данных Chan")
-
     output.seek(0)
     return output
+
+def _export_with_openpyxl(mg_df: pd.DataFrame,
+                          chan_df: pd.DataFrame,
+                          diagnosis_df: pd.DataFrame) -> BytesIO:
+    """
+    Фоллбек-экспорт без xlsxwriter: чистый openpyxl (+ Pillow).
+    Картинки тоже вставляем (в ячейку J<row>).
+    """
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    from openpyxl.drawing.image import Image as XLImage
+
+    wb = Workbook()
+
+    # Summary
+    ws = wb.active
+    ws.title = "Summary"
+    if diagnosis_df is not None and not diagnosis_df.empty:
+        for r in dataframe_to_rows(diagnosis_df, index=False, header=True):
+            ws.append(r)
+    else:
+        ws.cell(row=1, column=1, value="Нет сводных диагнозов")
+
+    # MG
+    ws_mg = wb.create_sheet("MG")
+    cur = 1
+    if mg_df is not None and not mg_df.empty:
+        for well, g in mg_df.groupby("well", sort=False):
+            ws_mg.cell(row=cur, column=1, value=f"Скважина {well} — MG")
+            cur += 1
+            g_reset = g.reset_index(drop=True)
+            # таблица
+            for r in dataframe_to_rows(g_reset, index=False, header=True):
+                ws_mg.append(r)
+            # картинка
+            img_buf = _render_plot_image("MG", g, well)
+            pil_img = PILImage.open(img_buf)
+            xl_img = XLImage(pil_img)
+            xl_img.anchor = f"J{cur}"
+            ws_mg.add_image(xl_img)
+            cur = cur + len(g_reset) + 4
+    else:
+        ws_mg.cell(row=1, column=1, value="Нет данных MG")
+
+    # Chan
+    ws_ch = wb.create_sheet("Chan")
+    cur = 1
+    if chan_df is not None and not chan_df.empty:
+        for well, g in chan_df.groupby("well", sort=False):
+            ws_ch.cell(row=cur, column=1, value=f"Скважина {well} — Chan")
+            cur += 1
+            g_reset = g.reset_index(drop=True)
+            for r in dataframe_to_rows(g_reset, index=False, header=True):
+                ws_ch.append(r)
+            img_buf = _render_plot_image("Chan", g, well)
+            pil_img = PILImage.open(img_buf)
+            xl_img = XLImage(pil_img)
+            xl_img.anchor = f"J{cur}"
+            ws_ch.add_image(xl_img)
+            cur = cur + len(g_reset) + 4
+    else:
+        ws_ch.cell(row=1, column=1, value="Нет данных Chan")
+
+    # Сохранение в память
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
 
 # =========================
 # Основной UI/поток
