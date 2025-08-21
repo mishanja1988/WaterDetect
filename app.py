@@ -114,9 +114,24 @@ def enforce_monotonic_per_well(dfin: pd.DataFrame) -> pd.DataFrame:
         out.append(g)
     return pd.concat(out, axis=0).reset_index(drop=True)
 
-def compute_cum_work_time(group: pd.DataFrame, ser_BR: pd.Series, ser_AJ: pd.Series) -> pd.Series:
-    br = ser_BR.astype(str).fillna("") if ser_BR is not None else pd.Series([""]*len(group), index=group.index)
-    aj = pd.to_numeric(ser_AJ, errors="coerce").fillna(0.0).to_numpy() if ser_AJ is not None else np.zeros(len(group))
+def compute_cum_work_time(group: pd.DataFrame,
+                          col_BR: Optional[str],
+                          col_AJ: Optional[str]) -> pd.Series:
+    """
+    Накопленное время работы:
+    если BR[i] == BR[i-1] → AJ[i] + cum[i-1], иначе AJ[i]
+    Считаем по порядку строк в группе.
+    """
+    if col_BR and col_BR in group.columns:
+        br = group[col_BR].astype(str).fillna("")
+    else:
+        br = pd.Series([""] * len(group), index=group.index)
+
+    if col_AJ and col_AJ in group.columns:
+        aj = pd.to_numeric(group[col_AJ], errors="coerce").fillna(0.0).to_numpy()
+    else:
+        aj = np.zeros(len(group), dtype=float)
+
     out = np.zeros(len(group), dtype=float)
     for i in range(len(group)):
         if i == 0:
@@ -124,6 +139,7 @@ def compute_cum_work_time(group: pd.DataFrame, ser_BR: pd.Series, ser_AJ: pd.Ser
         else:
             out[i] = aj[i] + out[i-1] if br.iloc[i] == br.iloc[i-1] else aj[i]
     return pd.Series(out, index=group.index, name="Накопленное время работы")
+
 
 def data_preparation(init_data: pd.DataFrame) -> pd.DataFrame:
     dfn = init_data.copy()
@@ -168,10 +184,14 @@ def data_preparation(init_data: pd.DataFrame) -> pd.DataFrame:
         dfn["ВНФ"] = np.nan
 
     # Накопленное время работы (по Well_calc)
-    dfn["Накопленное время работы"] = 0.0
-    for w, g in dfn.groupby("Well_calc", sort=False):
-        dfn.loc[g.index, "Накопленное время работы"] = compute_cum_work_time(g, sBR.loc[g.index] if sBR is not None else None,
-                                                                             sAJ.loc[g.index] if sAJ is not None else None)
+    # Накопленное время работы (по Well_calc отдельно)
+    if cBR and cAJ:
+        dfn = dfn.copy()
+        dfn["Накопленное время работы"] = 0.0
+        for w, g in dfn.groupby("Well_calc", sort=False):
+            dfn.loc[g.index, "Накопленное время работы"] = compute_cum_work_time(g, cBR, cAJ)
+    else:
+        dfn["Накопленное время работы"] = np.arange(len(dfn), dtype=float)
 
     # ВНФ'
     try:
@@ -493,3 +513,4 @@ def show():
             ax_mg.scatter(mg_g['MG_X'], mg_g['MG_Y'], label='MG: Y(X)', s=16)
             ax_mg.set_title(f'MG — скважина {w}')
             ax_mg.set_xlabel('X = Qt_cum / Qt_cum(T
+
