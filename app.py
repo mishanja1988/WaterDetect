@@ -10,7 +10,6 @@ from typing import Optional, List, Dict
 from io import BytesIO
 import sys
 import os
-from io import BytesIO
 import xlsxwriter
 
 
@@ -32,7 +31,7 @@ st.set_page_config(
 
 st.write('### Поскважинный автодиагноз нефтяных скважин по механизму обводнения')
 st.markdown(
-    '''
+    """
 **Суть работы:** проведение расчетно-аналитического способов механизма обводнения скважин с использованием методики Чена (Chan) и Меркуловой–Гинзбурга (MG) по нефтяным скважинам на основе пользовательских исходных данных.
 
 **Что необходимо сделать:**  
@@ -41,7 +40,7 @@ st.markdown(
 3. Подгрузить Ваш шаблон в окно подгрузки данных;  
 4. Получить результат — текстовый и визуальный автодиагноз по каждой скважине;  
 5. Скачать результирующие таблицы для анализа.
-'''
+"""
 )
 
 # =========================
@@ -75,16 +74,19 @@ def save_df_to_excel(df, ind=False):
     output.seek(0)
     return output
 
-@st.cache_data
+
 def read_examples():
     # Читаем новый шаблон из вложения
-    if os.path.exists(TEMPLATE_PATH):
-        df_template = pd.read_excel(TEMPLATE_PATH)
-    else:
-        #st.warning("Шаблон не найден по пути /mnt/data/Сосновское_clean.xlsx. Использую пустой DataFrame.")
+    try:
+        if os.path.exists(TEMPLATE_PATH):
+            df_template = pd.read_excel(TEMPLATE_PATH)
+        else:
+            df_template = pd.DataFrame()
+    except Exception:
         df_template = pd.DataFrame()
     # Возвращаем два одинаковых DF, чтобы сохранить интерфейс кнопок выгрузки
     return df_template, df_template
+
 
 def upload_examples():
     global example_csv, example_excel
@@ -600,3 +602,4 @@ def show():
 # =========================
 if __name__ == '__main__':
     show()
+
