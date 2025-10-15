@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-# Streamlit app: Автодиагностика скважин (Chan & Меркулова–Гинзбург) с поддержкой "Пласт"
+# Streamlit app: Автодиагностика скважин (Chan & Меркулова–Гинзбург) по (Скважина|Пласт)
 from __future__ import annotations
 
-import os, re, io, unicodedata, pathlib
+import os, io, re, unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -15,7 +15,6 @@ import streamlit as st
 # Глобальные настройки
 # ========================
 EPS = 1e-9
-TEMPLATE_PATH = "data/templates/Сосновское_clean.xlsx"  # ваш шаблон c колонкой "Пласт"
 MIN_POINTS_DEFAULT = 8
 SHARED_WATERCUT_THR_DEFAULT = 0.02
 
@@ -30,7 +29,8 @@ st.set_page_config(
 # Утилиты
 # ========================
 def _norm(s):
-    if not isinstance(s, str): return str(s)
+    if not isinstance(s, str):
+        return str(s)
     s = unicodedata.normalize("NFKC", s).replace("\u00A0", " ").replace("\xa0", " ")
     return re.sub(r"\s+", " ", s.strip())
 
@@ -47,89 +47,11 @@ def _bytes_of_upload(uploaded_file) -> bytes:
     uploaded_file.seek(0)
     return b
 
-# ========================
-# Примеры (неубиваемое чтение)
-# ========================
-@st.cache_data
-def read_template_df() -> pd.DataFrame:
-    try:
-        if os.path.exists(TEMPLATE_PATH):
-            df = pd.read_excel(TEMPLATE_PATH)
-            return _drop_unnamed(df)
-    except Exception:
-        pass
-    # fallback — мини-шаблон
-    return pd.DataFrame({
-        "Скважина": ["A-01","A-01","A-02","A-02"],
-        "Пласт":    ["Ю1","Ю1","Ю2","Ю3"],
-        "Дата":     pd.to_datetime(["2024-01-01","2024-02-01","2024-01-01","2024-02-01"]),
-        "Дни добычи": [31, 29, 31, 29],
-        "Жидкость, м3/сут": [100, 120, 90, 110],
-        "Обводнённость, %": [10, 20, 5, 15],
-    })
-
-@st.cache_data
-def read_examples() -> tuple[pd.DataFrame, pd.DataFrame]:
-    csv_path = "data/templates/df_raw.csv"
-    xlsx_path = "data/templates/df_raw.xlsx"
-    example_csv, example_excel = None, None
-
-    # CSV: перебор кодировок и авто-разделителя
-    if os.path.exists(csv_path):
-        last_exc = None
-        for enc in ("utf-8", "utf-8-sig", "cp1251", "latin1"):
-            try:
-                tmp = pd.read_csv(csv_path, sep=None, engine="python", encoding=enc, on_bad_lines="skip")
-                example_csv = _drop_unnamed(tmp)
-                break
-            except Exception as e:
-                last_exc = e
-        if example_csv is None:
-            st.warning(f"Не удалось прочитать {csv_path}: {last_exc}")
-    # XLSX
-    if os.path.exists(xlsx_path):
-        try:
-            tmp = pd.read_excel(xlsx_path, engine="openpyxl")
-            example_excel = _drop_unnamed(tmp)
-        except Exception as e:
-            st.warning(f"Не удалось прочитать {xlsx_path}: {e}")
-
-    if example_csv is None and example_excel is None:
-        demo = read_template_df()
-        return demo.copy(), demo.copy()
-    if example_csv is None: example_csv = example_excel.copy()
-    if example_excel is None: example_excel = example_csv.copy()
-    return example_csv, example_excel
-
-def save_df_to_excel(df: pd.DataFrame, ind: bool = False) -> io.BytesIO:
-    bio = io.BytesIO()
-    df.to_excel(bio, index=ind, engine="openpyxl")
-    bio.seek(0)
-    return bio
-
-def download_template_and_examples():
-    st.write("**Шаблоны и примеры:**")
-    tpl = read_template_df()
-    ex_csv, ex_xlsx = read_examples()
-    c1, c2, c3 = st.columns(3)
-    c1.download_button(
-        "📄 Шаблон (XLSX, с колонкой «Пласт»)",
-        data=save_df_to_excel(tpl),
-        file_name="template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    c2.download_button(
-        "🧪 Пример (.csv)",
-        data=ex_csv.to_csv(index=False).encode("utf-8-sig"),
-        file_name="example.csv",
-        mime="text/csv",
-    )
-    c3.download_button(
-        "🧪 Пример (.xlsx)",
-        data=save_df_to_excel(ex_xlsx),
-        file_name="example.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+def _slice_by_well_id(df: pd.DataFrame, wid: str) -> pd.DataFrame:
+    """Безопасная выборка по well_id."""
+    if df is None or df.empty or "well_id" not in df.columns:
+        return pd.DataFrame()
+    return df[df["well_id"] == wid]
 
 # ========================
 # Чтение пользовательского файла (устойчиво к кодировкам)
@@ -137,13 +59,12 @@ def download_template_and_examples():
 @st.cache_data
 def read_user_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
     name = (filename or "").lower()
+    # Excel
     if name.endswith(".xlsx") or name.endswith(".xls"):
-        # настоящий Excel
         df = pd.read_excel(io.BytesIO(file_bytes))
         return _drop_unnamed(df)
 
-    # CSV или "ложный excel"
-    # попробуем разделитель и кодировку автоматически
+    # CSV или «ложный Excel»
     last_exc = None
     for enc in ("utf-8", "utf-8-sig", "cp1251", "latin1"):
         try:
@@ -154,41 +75,40 @@ def read_user_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
     raise ValueError(f"Не удалось прочитать файл как CSV/Excel: {last_exc}")
 
 # ========================
-# Подготовка данных: well + пласт => well_id
+# Подготовка: проверяем «Скважина» и «Пласт», создаём well_id
 # ========================
-def _build_well_layer(df: pd.DataFrame) -> pd.DataFrame:
-    cols = {c.lower(): c for c in df.columns}
+def _ensure_well_and_layer(df: pd.DataFrame) -> pd.DataFrame:
+    """Гарантирует наличие колонок 'Скважина' и 'Пласт'. Создаёт их при необходимости.
+       Формирует виртуальный идентификатор well_id = 'Скважина | Пласт'."""
+    cols_map = {c.lower(): c for c in df.columns}
 
     # --- Скважина ---
     well_col = None
     for cand in ["скважина", "скв", "скв.", "well", "id", "номер"]:
-        if cand in cols:
-            well_col = cols[cand]
+        if cand in cols_map:
+            well_col = cols_map[cand]
             break
-    if well_col is not None:
-        well = df[well_col].astype(str).fillna("")
-    else:
-        # если вообще нет — создаём фиктивный столбец
+    if well_col is None:
+        # создаём столбец «Скважина», если его нет
+        df = df.copy()
         df["Скважина"] = [f"WELL_{i+1}" for i in range(len(df))]
-        well = df["Скважина"].astype(str)
+        well_col = "Скважина"
 
     # --- Пласт ---
     layer_col = None
     for cand in ["пласт", "пл", "layer", "horizon", "formation"]:
-        if cand in cols:
-            layer_col = cols[cand]
+        if cand in cols_map:
+            layer_col = cols_map[cand]
             break
     if layer_col is None:
-        # если нет пласта — создаём новый столбец с 'UNK'
+        df = df.copy()
         df["Пласт"] = "UNK"
-        layer = df["Пласт"].astype(str)
-    else:
-        layer = df[layer_col].astype(str).fillna("").replace({"": "UNK"})
+        layer_col = "Пласт"
 
     out = df.copy()
-    out["well"] = well.str.strip()
-    out["layer"] = layer.str.strip()
-    out["well_id"] = (out["well"] + " | " + out["layer"]).str.strip()
+    out["Скважина"] = out[well_col].astype(str).fillna("").str.strip()
+    out["Пласт"] = out[layer_col].astype(str).fillna("").replace({"": "UNK"}).str.strip()
+    out["well_id"] = (out["Скважина"] + " | " + out["Пласт"]).str.strip()
     return out
 
 def enforce_monotonic_per_entity(df: pd.DataFrame) -> pd.DataFrame:
@@ -203,30 +123,29 @@ def enforce_monotonic_per_entity(df: pd.DataFrame) -> pd.DataFrame:
 def prepare_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
     raw = read_user_file(file_bytes, filename)
     raw.columns = [_norm(c) for c in raw.columns]
-    df = _build_well_layer(raw)
+    df = _ensure_well_and_layer(raw)
 
-    # Подхватываем наиболее типовые названия
+    # Наиболее частые имена
     cols = {c.lower(): c for c in df.columns}
     def pick(*names):
         for n in names:
-            if n in cols: return cols[n]
+            if n in cols:
+                return cols[n]
         return None
 
-    # Жидкость и обводненность (или X/AB)
+    # Жидкость и обводнённость
     c_liq = pick("жидкость, м3/сут", "дебит жидкости, м3/сут", "liquid", "x")
     c_wc  = pick("обводнённость, %", "обводненность, %", "watercut %", "ab")
-    if c_liq is None and "X" in df.columns: c_liq = "X"
-    if c_wc is None and "AB" in df.columns: c_wc = "AB"
+    if c_liq is None and "X" in df.columns:  c_liq = "X"
+    if c_wc  is None and "AB" in df.columns:  c_wc  = "AB"
 
     # Дни добычи
     c_days = pick("дни добычи", "число дней добычи нефти, сут", "prod_days", "aj")
-
-    # Серия (опц.)
+    # Серия (опционально)
     c_series = pick("серия", "смена режима", "br")
 
-    # Пересчёты
     liq = _to_num(df[c_liq], 0.0) if c_liq else pd.Series(0.0, index=df.index)
-    wc  = _to_num(df[c_wc], 0.0) if c_wc else pd.Series(0.0, index=df.index)
+    wc  = _to_num(df[c_wc],  0.0) if c_wc  else pd.Series(0.0, index=df.index)
 
     df["qo_period"] = liq * (100.0 - wc) / 100.0
     df["qw_period"] = liq * wc / 100.0
@@ -240,7 +159,7 @@ def prepare_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
         df["qw"] = np.where(days > 0, df["qw_period"] / days, np.nan)
         df["qL"] = np.where(days > 0, df["qL_period"] / days, np.nan)
 
-    # Накопленное время по сущности (well_id), опционально сброс по серии
+    # Накопленное время (по well_id), при наличии серии — с обнулением
     if c_days:
         if c_series:
             series = df[c_series].astype(str).fillna("")
@@ -257,7 +176,7 @@ def prepare_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
     return df
 
 # ========================
-# Единый допуск сущностей
+# Единый допуск по well_id
 # ========================
 @st.cache_data
 def select_eligible_entities(df: pd.DataFrame, min_points: int, watercut_thr: float) -> Tuple[str, ...]:
@@ -265,12 +184,11 @@ def select_eligible_entities(df: pd.DataFrame, min_points: int, watercut_thr: fl
         fw = df["qw_period"] / df["qL_period"]
     ok = (df["qL_period"] > 0) & (fw > watercut_thr) & (df["prod_days"] > 0)
     cnt = ok.groupby(df["well_id"], sort=False).sum()
-
     eligible = tuple(cnt.index[cnt >= min_points].sort_values())
-    if len(eligible) == 0:
-        # если нет допущенных — хотя бы одна фиктивная пара
-        fake_id = df["well_id"].iloc[0] if len(df) else "FAKE | UNK"
-        return (fake_id,)
+
+    # если никого не прошло — используем все уникальные well_id (без шумной ошибки)
+    if len(eligible) == 0 and "well_id" in df.columns and not df.empty:
+        return tuple(pd.Index(df["well_id"].unique()).astype(str))
     return eligible
 
 # ========================
@@ -286,7 +204,10 @@ class MGFlags:
     possible_mixed_causes: bool = False
 
 @st.cache_data
-def compute_mg(df: pd.DataFrame, eligible_ids: Tuple[str, ...], watercut_thr: float, min_points: int) -> pd.DataFrame:
+def compute_mg(df: pd.DataFrame, eligible_ids: Tuple[str, ...],
+               watercut_thr: float, min_points: int) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["well_id"])
     d = df[df["well_id"].isin(eligible_ids)].copy()
     with np.errstate(divide="ignore", invalid="ignore"):
         d["fw"] = d["qw_period"] / d["qL_period"]
@@ -295,11 +216,12 @@ def compute_mg(df: pd.DataFrame, eligible_ids: Tuple[str, ...], watercut_thr: fl
     outs = []
     for wid, g in d.groupby("well_id", sort=False):
         g = g.sort_values("t_num")
-        idx = np.flatnonzero((g["fw"].to_numpy() > watercut_thr) & (g["qL_period"].to_numpy() > 0) & (g["prod_days"].to_numpy() > 0))
+        idx = np.flatnonzero((g["fw"].to_numpy() > watercut_thr) &
+                             (g["qL_period"].to_numpy() > 0) &
+                             (g["prod_days"].to_numpy() > 0))
         if idx.size == 0:
             continue
         g2 = g.iloc[idx[0]:].copy()
-
         g2["Qo_cum"] = g2["qo_period"].cumsum()
         g2["Qw_cum"] = g2["qw_period"].cumsum()
         g2["Qt_cum"] = g2["Qo_cum"] + g2["Qw_cum"]
@@ -318,7 +240,6 @@ def compute_mg(df: pd.DataFrame, eligible_ids: Tuple[str, ...], watercut_thr: fl
         if early.sum() >= 3:
             flags.y_early_mean = float(np.nanmean(g2.loc[early, "MG_Y"]))
             flags.possible_behind_casing = (flags.y_early_mean is not None) and (flags.y_early_mean >= 0.99)
-
         first_third = g2[g2["MG_X"] <= 0.33]
         if len(first_third) >= 3:
             try:
@@ -327,7 +248,6 @@ def compute_mg(df: pd.DataFrame, eligible_ids: Tuple[str, ...], watercut_thr: fl
                 flags.possible_channeling = (k < -0.8)
             except np.linalg.LinAlgError:
                 pass
-
         if len(g2) >= 5:
             with np.errstate(invalid="ignore"):
                 dy = np.gradient(g2["MG_Y"].to_numpy(), g2["MG_X"].to_numpy())
@@ -339,7 +259,12 @@ def compute_mg(df: pd.DataFrame, eligible_ids: Tuple[str, ...], watercut_thr: fl
 
         outs.append(g2)
 
-    return pd.concat(outs, axis=0).reset_index(drop=True) if outs else pd.DataFrame()
+    if not outs:
+        return pd.DataFrame(columns=["well_id", "MG_X", "MG_Y"])
+    out_df = pd.concat(outs, axis=0).reset_index(drop=True)
+    if "well_id" not in out_df.columns:
+        out_df["well_id"] = ""
+    return out_df
 
 # ========================
 # Chan
@@ -355,6 +280,8 @@ class ChanFlags:
 
 @st.cache_data
 def compute_chan(df: pd.DataFrame, eligible_ids: Tuple[str, ...], min_points: int) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["well_id"])
     d = df[df["well_id"].isin(eligible_ids)].copy()
     outs = []
     for wid, g in d.groupby("well_id", sort=False):
@@ -395,13 +322,19 @@ def compute_chan(df: pd.DataFrame, eligible_ids: Tuple[str, ...], min_points: in
 
         outs.append(g)
 
-    return pd.concat(outs, axis=0).reset_index(drop=True) if outs else pd.DataFrame()
+    if not outs:
+        return pd.DataFrame(columns=["well_id", "t_pos", "WOR", "dWOR_dt", "dWOR_dt_pos"])
+    out_df = pd.concat(outs, axis=0).reset_index(drop=True)
+    if "well_id" not in out_df.columns:
+        out_df["well_id"] = ""
+    return out_df
 
 # ========================
 # Текстовые диагнозы
 # ========================
 def diag_mg(g: pd.DataFrame) -> Dict[str, str]:
-    if g.empty: return {"mg_text":"нет данных MG","mg_detail":""}
+    if g.empty:
+        return {"mg_text": "нет данных MG", "mg_detail": ""}
     r = g.iloc[-1]
     parts = []
     if r.get("MG_diag_possible_behind_casing"): parts.append("возможны заколонные перетоки (ранний нефтеотбор Y≈1)")
@@ -411,10 +344,11 @@ def diag_mg(g: pd.DataFrame) -> Dict[str, str]:
     y = r.get("MG_diag_y_early_mean", np.nan)
     k = r.get("MG_diag_slope_first_third", np.nan)
     w = r.get("MG_diag_waviness_std", np.nan)
-    return {"mg_text":"; ".join(parts), "mg_detail":f"MG метрики: y_early≈{y:.2f}; наклон≈{k:.2f}; волнистость≈{w:.2f}"}
+    return {"mg_text": "; ".join(parts), "mg_detail": f"MG метрики: y_early≈{y:.2f}; наклон≈{k:.2f}; волнистость≈{w:.2f}"}
 
 def diag_chan(g: pd.DataFrame) -> Dict[str, str]:
-    if g.empty: return {"chan_text":"нет данных Chan","chan_detail":""}
+    if g.empty:
+        return {"chan_text": "нет данных Chan", "chan_detail": ""}
     r = g.iloc[-1]
     parts = []
     if r.get("chan_diag_possible_multilayer_channeling"): parts.append("многослойное каналирование (рост WOR и дисперсии производной)")
@@ -424,13 +358,18 @@ def diag_chan(g: pd.DataFrame) -> Dict[str, str]:
     a = r.get("chan_diag_slope_logWOR_logt", np.nan)
     m = r.get("chan_diag_mean_derivative", np.nan)
     s = r.get("chan_diag_std_derivative", np.nan)
-    return {"chan_text":"; ".join(parts), "chan_detail":f"Chan метрики: наклон≈{a:.2f}; средн. dWOR/dt≈{m:.2e}; std≈{s:.2e}"}
+    return {"chan_text": "; ".join(parts), "chan_detail": f"Chan метрики: наклон≈{a:.2f}; средн. dWOR/dt≈{m:.2e}; std≈{s:.2e}"}
 
 # ========================
-# Экспорт
+# Экспорт Excel
 # ========================
 @st.cache_data
 def export_xlsx(mg_df: pd.DataFrame, chan_df: pd.DataFrame, diagnosis_df: pd.DataFrame) -> bytes:
+    # Нормализуем, чтобы не упасть на пустых фреймах
+    if mg_df is None or mg_df.empty:       mg_df = pd.DataFrame(columns=["well_id"])
+    if chan_df is None or chan_df.empty:   chan_df = pd.DataFrame(columns=["well_id"])
+    if diagnosis_df is None or diagnosis_df.empty:
+        diagnosis_df = pd.DataFrame(columns=["well_id", "mg_text", "mg_detail", "chan_text", "chan_detail"])
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         diagnosis_df.to_excel(writer, sheet_name="Summary", index=False)
@@ -440,13 +379,13 @@ def export_xlsx(mg_df: pd.DataFrame, chan_df: pd.DataFrame, diagnosis_df: pd.Dat
     return out.getvalue()
 
 # ========================
-# UI / Главный поток
+# UI
 # ========================
 st.markdown("""
-### Поскважинный автодиагноз (Chan & Меркулова–Гинзбург) — поддержка **Пласт**
+### Поскважинный автодиагноз (Chan & Меркулова–Гинзбург) — учёт **Скважины** и **Пласта**
 
-- Каждая пара **(Скважина, Пласт)** анализируется как **отдельная сущность** `well_id = "Скважина | Пласт"`.
-- Список допущенных сущностей общий для MG и Chan (≥ N точек после порога обводнённости).
+- Входной файл должен содержать **Скважина** и **Пласт**. Если чего-то не хватает — приложение создаст столбец автоматически.
+- Виртуальный ключ анализа: **well_id = "Скважина | Пласт"**. Все группировки, допуски, графики и экспорт ведутся по нему.
 """)
 
 with st.sidebar:
@@ -454,47 +393,51 @@ with st.sidebar:
     water_thr = st.number_input("Порог обводнённости fw", 0.0, 1.0, SHARED_WATERCUT_THR_DEFAULT, 0.01)
     min_pts   = st.number_input("Мин. число точек после порога", 3, 200, MIN_POINTS_DEFAULT, 1)
     max_plot  = st.slider("Сколько сущностей рисовать", 1, 50, 10)
-    st.caption("Сущность = (Скважина, Пласт). Для скорости графики ограничены этим числом.")
-
-download_template_and_examples()
+    st.caption("Сущность анализа = (Скважина, Пласт)")
 
 uploaded = st.file_uploader("Загрузите файл (.xlsx / .xls / .csv)", type=["xlsx","xls","csv"])
+
 if not uploaded:
-    st.info("Загрузите шаблон/пример с вашими данными и нажмите кнопку расчёта.")
+    st.info("Загрузите файл и нажмите «Запустить расчёт».")
 else:
     file_bytes = _bytes_of_upload(uploaded)
     if st.button("▶ Запустить расчёт"):
         with st.spinner("Подготовка данных..."):
             df = prepare_data(file_bytes, uploaded.name)
 
+        # Единый список допущенных well_id (или — все, если никто не прошёл)
         eligible_ids = select_eligible_entities(df, min_points=min_pts, watercut_thr=water_thr)
-        if not eligible_ids:
-            st.info("⚠️ В данных нет подходящих точек. Создана фиктивная пара для тестового расчёта.")
-
+        # Расчёты
         prog = st.progress(0, text="Расчёт MG…")
         mg_df   = compute_mg(df, eligible_ids, water_thr, min_pts); prog.progress(50, text="Расчёт Chan…")
         chan_df = compute_chan(df, eligible_ids, min_pts);          prog.progress(100, text="Готово")
 
+        # Нормализация на всякий случай
+        if mg_df is None or mg_df.empty or "well_id" not in mg_df.columns:
+            mg_df = pd.DataFrame(columns=["well_id"])
+        if chan_df is None or chan_df.empty or "well_id" not in chan_df.columns:
+            chan_df = pd.DataFrame(columns=["well_id"])
+
         # Диагнозы
         rows = []
         for wid in eligible_ids:
-            mg_g = mg_df[mg_df["well_id"] == wid]
-            ch_g = chan_df[chan_df["well_id"] == wid]
+            mg_g = _slice_by_well_id(mg_df, wid)
+            ch_g = _slice_by_well_id(chan_df, wid)
             rows.append({"well_id": wid, **diag_mg(mg_g), **diag_chan(ch_g)})
         diagnosis_df = pd.DataFrame(rows)
 
-        st.success(f"Готово: сущностей (скважина|пласт) — {len(eligible_ids)}")
+        st.success(f"Готово. Сущностей (Скважина|Пласт): {len(eligible_ids)}")
         st.subheader("Сводная таблица диагнозов")
         st.dataframe(diagnosis_df, use_container_width=True)
 
-        # Графики (ограниченный список)
-        st.subheader("Графики (ограничен списком для скорости)")
+        # Графики (ограниченный список для скорости)
+        st.subheader("Графики (ограниченный список)")
         show_ids = eligible_ids[:max_plot]
         cols = st.columns(2)
         for i, wid in enumerate(show_ids):
             with st.expander(f"{wid} — графики"):
-                mg_g = mg_df[mg_df["well_id"] == wid]
-                ch_g = chan_df[chan_df["well_id"] == wid]
+                mg_g = _slice_by_well_id(mg_df, wid)
+                ch_g = _slice_by_well_id(chan_df, wid)
 
                 with cols[i % 2]:
                     if not mg_g.empty:
@@ -506,7 +449,7 @@ else:
                         ax.set_title(f"MG — {wid}")
                         st.pyplot(fig)
                     else:
-                        st.info("Нет данных MG")
+                        st.info("Нет данных MG для этой сущности")
 
                     if not ch_g.empty:
                         fig2, ax2 = plt.subplots()
@@ -518,7 +461,7 @@ else:
                         ax2.set_title(f"Chan — {wid}")
                         st.pyplot(fig2)
                     else:
-                        st.info("Нет данных Chan")
+                        st.info("Нет данных Chan для этой сущности")
 
         # Экспорт
         st.subheader("Скачать результаты")
