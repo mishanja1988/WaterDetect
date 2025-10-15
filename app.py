@@ -257,4 +257,302 @@ def prepare_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
         df["t_num"] = df["prod_days"].groupby(df["well_id"]).cumsum()
 
     df = df.dropna(subset=["well_id", "t_num"]).sort_values(["well_id", "t_num"]).reset_index(drop=True)
-    df = enfor
+    df = enforce_monotonic_per_entity(df)
+    return df
+
+# ========================
+# Единый допуск и причины недопуска
+# ========================
+@st.cache_data
+def select_eligible_entities_with_reasons(df: pd.DataFrame, min_points: int, watercut_thr: float) -> Tuple[Tuple[str, ...], Dict[str,str]]:
+    reasons: Dict[str,str] = {}
+    if df.empty:
+        return tuple(), reasons
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fw = df["qw_period"] / df["qL_period"]
+    cond = (df["qL_period"] > 0) & (fw > watercut_thr) & (df["prod_days"] > 0)
+
+    eligible = []
+    for wid, g in df.groupby("well_id", sort=False):
+        ok = int(cond[g.index].sum())
+        if ok >= min_points:
+            eligible.append(wid)
+        else:
+            # собираем понятную причину
+            parts = []
+            if (g["qL_period"] > 0).sum() == 0:
+                parts.append("нет положительных объёмов жидкости")
+            if (g["prod_days"] > 0).sum() == 0:
+                parts.append("нет положительных дней добычи")
+            if ok < min_points:
+                parts.append(f"точек после fw>{watercut_thr:.2f}: {ok} (нужно ≥{min_points})")
+            reasons[wid] = "; ".join(parts) if parts else "недостаточно валидных точек"
+    return tuple(eligible), reasons
+
+# ========================
+# MG
+# ========================
+@dataclass
+class MGFlags:
+    y_early_mean: Optional[float] = None
+    slope_first_third: Optional[float] = None
+    waviness_std: Optional[float] = None
+    possible_behind_casing: bool = False
+    possible_channeling: bool = False
+    possible_mixed_causes: bool = False
+
+@st.cache_data
+def compute_mg(df: pd.DataFrame, eligible_ids: Tuple[str, ...], watercut_thr: float, min_points: int) -> pd.DataFrame:
+    if df.empty or len(eligible_ids) == 0:
+        return pd.DataFrame(columns=["well_id","MG_X","MG_Y"])
+    d = df[df["well_id"].isin(eligible_ids)].copy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d["fw"] = d["qw_period"] / d["qL_period"]
+    d = d.replace([np.inf, -np.inf], np.nan)
+
+    outs = []
+    for wid, g in d.groupby("well_id", sort=False):
+        g = g.sort_values("t_num")
+        idx = np.flatnonzero((g["fw"].to_numpy() > watercut_thr) &
+                             (g["qL_period"].to_numpy() > 0) &
+                             (g["prod_days"].to_numpy() > 0))
+        if idx.size == 0:
+            continue
+        g2 = g.iloc[idx[0]:].copy()
+        g2["Qo_cum"] = g2["qo_period"].cumsum()
+        g2["Qw_cum"] = g2["qw_period"].cumsum()
+        g2["Qt_cum"] = g2["Qo_cum"] + g2["Qw_cum"]
+        if (len(g2) < min_points) or (float(g2["Qt_cum"].iloc[-1]) <= 0):
+            continue
+
+        Qt_T = float(g2["Qt_cum"].iloc[-1])
+        X = (g2["Qt_cum"] / Qt_T).to_numpy()
+        X = np.maximum.accumulate(X) + np.arange(len(X)) * EPS
+        g2["MG_X"] = X
+        with np.errstate(divide="ignore", invalid="ignore"):
+            g2["MG_Y"] = g2["Qo_cum"] / g2["Qt_cum"]
+
+        # флаги
+        flags = MGFlags()
+        early = g2["MG_X"] <= 0.2
+        if early.sum() >= 3:
+            flags.y_early_mean = float(np.nanmean(g2.loc[early, "MG_Y"]))
+            flags.possible_behind_casing = (flags.y_early_mean is not None) and (flags.y_early_mean >= 0.99)
+        first_third = g2[g2["MG_X"] <= 0.33]
+        if len(first_third) >= 3:
+            try:
+                k, _ = np.polyfit(first_third["MG_X"], first_third["MG_Y"], 1)
+                flags.slope_first_third = float(k)
+                flags.possible_channeling = (k < -0.8)
+            except np.linalg.LinAlgError:
+                pass
+        if len(g2) >= 5:
+            with np.errstate(invalid="ignore"):
+                dy = np.gradient(g2["MG_Y"].to_numpy(), g2["MG_X"].to_numpy())
+            flags.waviness_std = float(np.nanstd(dy))
+            flags.possible_mixed_causes = flags.waviness_std > 1.0
+
+        for k, v in vars(flags).items():
+            g2[f"MG_diag_{k}"] = v
+
+        outs.append(g2)
+
+    return (pd.concat(outs, axis=0).reset_index(drop=True) if outs
+            else pd.DataFrame(columns=["well_id","MG_X","MG_Y"]))
+
+# ========================
+# Chan
+# ========================
+@dataclass
+class ChanFlags:
+    slope_logWOR_logt: Optional[float] = None
+    mean_derivative: Optional[float] = None
+    std_derivative: Optional[float] = None
+    possible_coning: bool = False
+    possible_near_wellbore: bool = False
+    possible_multilayer_channeling: bool = False
+
+@st.cache_data
+def compute_chan(df: pd.DataFrame, eligible_ids: Tuple[str, ...], min_points: int) -> pd.DataFrame:
+    if df.empty or len(eligible_ids) == 0:
+        return pd.DataFrame(columns=["well_id","t_pos","WOR","dWOR_dt","dWOR_dt_pos"])
+    d = df[df["well_id"].isin(eligible_ids)].copy()
+    outs = []
+    for wid, g in d.groupby("well_id", sort=False):
+        g = g.sort_values("t_num").copy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            g["WOR"] = g["qw"] / g["qo"]
+        g = g.replace([np.inf, -np.inf], np.nan)
+        g = g[(g["qo"] > 0) & (g["WOR"] > 0)].dropna(subset=["WOR"])
+        if len(g) < min_points:
+            continue
+
+        g["t_pos"] = g["t_num"] - g["t_num"].min() + EPS
+        with np.errstate(invalid="ignore"):
+            g["dWOR_dt"] = np.gradient(g["WOR"].to_numpy(), g["t_pos"].to_numpy())
+        g["dWOR_dt_pos"] = np.where(g["dWOR_dt"] > 0, g["dWOR_dt"], np.nan)
+
+        mask = (g["WOR"] > 0) & (g["t_pos"] > 0)
+        a = np.nan
+        if mask.sum() >= 3:
+            x = np.log(g.loc[mask, "t_pos"].to_numpy())
+            y = np.log(g.loc[mask, "WOR"].to_numpy())
+            try:
+                a, _ = np.polyfit(x, y, 1)
+            except np.linalg.LinAlgError:
+                pass
+
+        flags = ChanFlags()
+        flags.slope_logWOR_logt = float(a)
+        flags.mean_derivative = float(np.nanmean(g["dWOR_dt"]))
+        flags.std_derivative = float(np.nanstd(g["dWOR_dt"]))
+        if not np.isnan(a):
+            flags.possible_coning = a > 0.5 and flags.mean_derivative > 0
+            flags.possible_near_wellbore = a > 1.0 and flags.mean_derivative > 0
+            flags.possible_multilayer_channeling = a > 0 and flags.std_derivative > 0.1
+
+        for k, v in vars(flags).items():
+            g[f"chan_diag_{k}"] = v
+
+        outs.append(g)
+
+    return (pd.concat(outs, axis=0).reset_index(drop=True) if outs
+            else pd.DataFrame(columns=["well_id","t_pos","WOR","dWOR_dt","dWOR_dt_pos"]))
+
+# ========================
+# Текстовые диагнозы
+# ========================
+def diag_mg(g: pd.DataFrame) -> Dict[str, str]:
+    if g.empty: return {"mg_text":"нет данных MG","mg_detail":""}
+    r = g.iloc[-1]
+    parts = []
+    if r.get("MG_diag_possible_behind_casing"): parts.append("возможны заколонные перетоки (ранний нефтеотбор Y≈1)")
+    if r.get("MG_diag_possible_channeling"):    parts.append("признаки каналирования (крутой спад Y в первой трети)")
+    if r.get("MG_diag_possible_mixed_causes"):  parts.append("смешанные причины (высокая волнистость dY/dX)")
+    if not parts: parts.append("ближе к равномерному обводнению")
+    y = r.get("MG_diag_y_early_mean", np.nan)
+    k = r.get("MG_diag_slope_first_third", np.nan)
+    w = r.get("MG_diag_waviness_std", np.nan)
+    return {"mg_text":"; ".join(parts), "mg_detail":f"MG метрики: y_early≈{y:.2f}; наклон≈{k:.2f}; волнистость≈{w:.2f}"}
+
+def diag_chan(g: pd.DataFrame) -> Dict[str, str]:
+    if g.empty: return {"chan_text":"нет данных Chan","chan_detail":""}
+    r = g.iloc[-1]
+    parts = []
+    if r.get("chan_diag_possible_multilayer_channeling"): parts.append("многослойное каналирование (рост WOR и дисперсии производной)")
+    if r.get("chan_diag_possible_near_wellbore"):         parts.append("приствольные проблемы/ранний канал (очень высокий наклон)")
+    if r.get("chan_diag_possible_coning"):                parts.append("возможен конинг (наклон > 0.5 при положительной производной)")
+    if not parts: parts.append("нет выраженных признаков проблемного притока воды")
+    a = r.get("chan_diag_slope_logWOR_logt", np.nan)
+    m = r.get("chan_diag_mean_derivative", np.nan)
+    s = r.get("chan_diag_std_derivative", np.nan)
+    return {"chan_text":"; ".join(parts), "chan_detail":f"Chan метрики: наклон≈{a:.2f}; средн. dWOR/dt≈{m:.2e}; std≈{s:.2e}"}
+
+# ========================
+# Экспорт Excel
+# ========================
+@st.cache_data
+def export_xlsx(mg_df: pd.DataFrame, chan_df: pd.DataFrame, diagnosis_df: pd.DataFrame) -> bytes:
+    if mg_df is None or mg_df.empty:       mg_df = pd.DataFrame(columns=["well_id"])
+    if chan_df is None or chan_df.empty:   chan_df = pd.DataFrame(columns=["well_id"])
+    if diagnosis_df is None or diagnosis_df.empty:
+        diagnosis_df = pd.DataFrame(columns=["well_id","mg_text","mg_detail","chan_text","chan_detail","reason"])
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        diagnosis_df.to_excel(writer, sheet_name="Summary", index=False)
+        mg_df.to_excel(writer, sheet_name="MG", index=False)
+        chan_df.to_excel(writer, sheet_name="Chan", index=False)
+    out.seek(0)
+    return out.getvalue()
+
+# ========================
+# UI / Главный поток
+# ========================
+with st.sidebar:
+    st.subheader("Параметры допуска")
+    water_thr = st.number_input("Порог обводнённости fw", 0.0, 1.0, SHARED_WATERCUT_THR_DEFAULT, 0.01)
+    min_pts   = st.number_input("Мин. число точек после порога", 3, 200, MIN_POINTS_DEFAULT, 1)
+    max_plot  = st.slider("Сколько сущностей рисовать", 1, 50, 10)
+    st.caption("Сущность анализа = (Скважина, Пласт)")
+
+uploaded = st.file_uploader("Загрузите файл (.xlsx / .xls / .csv)", type=["xlsx","xls","csv"])
+
+if not uploaded:
+    st.info("Загрузите файл и нажмите «Запустить расчёт».")
+else:
+    file_bytes = _bytes_of_upload(uploaded)
+    if st.button("▶ Запустить расчёт"):
+        with st.spinner("Подготовка данных..."):
+            df = prepare_data(file_bytes, uploaded.name)
+
+        # Список допущенных + причины отказа
+        eligible_ids, reasons = select_eligible_entities_with_reasons(df, min_points=min_pts, watercut_thr=water_thr)
+
+        # Если никто не прошёл — для отображения используем все well_id (но покажем причины в Summary)
+        if len(eligible_ids) == 0 and "well_id" in df.columns and not df.empty:
+            eligible_ids = tuple(pd.Index(df["well_id"].unique()).astype(str))
+
+        prog = st.progress(0, text="Расчёт MG…")
+        mg_df   = compute_mg(df, eligible_ids, water_thr, min_pts); prog.progress(50, text="Расчёт Chan…")
+        chan_df = compute_chan(df, eligible_ids, min_pts);          prog.progress(100, text="Готово")
+
+        # Сводная таблица диагнозов (+причина, если не прошло допуск)
+        rows = []
+        for wid in eligible_ids:
+            mg_g = _slice_by_well_id(mg_df, wid)
+            ch_g = _slice_by_well_id(chan_df, wid)
+            row = {"well_id": wid, **diag_mg(mg_g), **diag_chan(ch_g)}
+            if wid in reasons:
+                row["reason"] = reasons[wid]
+            rows.append(row)
+        diagnosis_df = pd.DataFrame(rows)
+
+        st.success(f"Готово. Сущностей (Скважина|Пласт): {len(eligible_ids)}")
+        st.subheader("Сводная таблица диагнозов")
+        st.dataframe(diagnosis_df, use_container_width=True)
+
+        # Графики (ограниченный список для скорости)
+        st.subheader("Графики (ограниченный список)")
+        show_ids = eligible_ids[:max_plot]
+        cols = st.columns(2)
+        for i, wid in enumerate(show_ids):
+            with st.expander(f"{wid} — графики"):
+                mg_g = _slice_by_well_id(mg_df, wid)
+                ch_g = _slice_by_well_id(chan_df, wid)
+
+                with cols[i % 2]:
+                    if not mg_g.empty:
+                        fig, ax = plt.subplots()
+                        ax.scatter(mg_g["MG_X"], mg_g["MG_Y"], s=10)
+                        ax.grid(True, alpha=0.3)
+                        ax.set_xlabel("X = Qt_cum/Qt_cum(T)")
+                        ax.set_ylabel("Y = Qo_cum/Qt_cum")
+                        ax.set_title(f"MG — {wid}")
+                        st.pyplot(fig)
+                    else:
+                        st.info("Нет данных MG для этой сущности")
+
+                    if not ch_g.empty:
+                        fig2, ax2 = plt.subplots()
+                        ax2.plot(ch_g["t_pos"], ch_g["WOR"], "o", markersize=3, label="WOR")
+                        ax2.plot(ch_g["t_pos"], ch_g["dWOR_dt_pos"], "--", label="|dWOR/dt|")
+                        ax2.set_xscale("log"); ax2.set_yscale("log")
+                        ax2.grid(True, which="both", alpha=0.3); ax2.legend()
+                        ax2.set_xlabel("t_pos (дни)"); ax2.set_ylabel("WOR, |dWOR/dt|")
+                        ax2.set_title(f"Chan — {wid}")
+                        st.pyplot(fig2)
+                    else:
+                        st.info("Нет данных Chan для этой сущности")
+
+        # Экспорт
+        st.subheader("Скачать результаты")
+        xlsx_bytes = export_xlsx(mg_df, chan_df, diagnosis_df)
+        st.download_button(
+            "📥 Единый Excel (Summary, MG, Chan) по (Скважина|Пласт)",
+            data=xlsx_bytes,
+            file_name="Autodiagnostics_results_by_layer.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.info("Интерфейс готов. Нажмите «Запустить расчёт».")
