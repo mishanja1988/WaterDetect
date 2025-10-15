@@ -1,28 +1,25 @@
+# app.py — Автодиагностика скважин (всё в одном файле)
+
 from __future__ import annotations
 
 import os
 import re
 import unicodedata
 from dataclasses import dataclass
+from typing import Dict, List, Optional
 from io import BytesIO
-from typing import Dict, List, Optional, Set
+
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import streamlit as st
-import openpyxl  # используется в фолбэке экспорта
-from openpyxl.utils.dataframe import dataframe_to_rows
+
 
 # =========================
 # Глобальные настройки
 # =========================
 EPS = 1e-9
 TEMPLATE_PATH = "data/templates/Сосновское_clean.xlsx"
-
-# Единые параметры отбора скважин/точек
-MIN_POINTS = 8                # минимальное число валидных точек для обеих методик
-SHARED_WATERCUT_THR = 0.02    # порог начальной обводнённости fw
 
 st.set_page_config(
     layout="wide",
@@ -31,31 +28,33 @@ st.set_page_config(
     page_icon="🛢️",
 )
 
-# === Описание ===
+st.write("### Поскважинный автодиагноз нефтяных скважин по механизму обводнения")
+
 DESCRIPTION_MD = """
-### Поскважинный автодиагноз нефтяных скважин по механизму обводнения
+**Суть работы:** проведение расчётно-аналитического автодиагноза механизма обводнения по методикам Чена (Chan) и Меркуловой–Гинзбурга (MG) на основе пользовательских исходных данных.
 
-**Что делает приложение:** рассчитывает признаки механизма обводнения по двум подходам — **Chan** и **Меркуловой–Гинзбурга (MG)** — и формирует текстовые выводы, графики и единый Excel с результатами.
+**Что необходимо сделать:**
+1. Скачать шаблон исходных данных;
+2. Заполнить шаблон своими данными;
+3. Загрузить файл в окно подгрузки;
+4. Получить текстовый и визуальный диагноз по каждой скважине;
+5. Скачать единый Excel c таблицами и графиками.
 
-**Как работать:**
-1. Скачайте шаблон исходных данных и заполните его;
-2. Загрузите файл (XLSX/XLS);
-3. Посмотрите диагнозы и графики по каждой скважине;
-4. Скачайте единый Excel с данными и графиками.
-
-**Важно про фильтрацию данных:**
-- Методики используют **разные рабочие признаки и «очистку» точек**:
-  - **MG** строится по кумулятивным объёмам и анализирует кривую `Y = Qo_cum/Qt_cum` от `X = Qt_cum/Qt_cum(T)`. На старте **отсекаются** периоды до достижения порога обводнённости `fw = qw_period/qL_period > {thr:.2f}`; требуются ≥{minp} валидных точек **после** порога.
-  - **Chan** работает с `WOR = qw/qo` во времени (лог–лог шкалы), поэтому **отбрасываются** точки с неположительными `qo`, `WOR` и нулевым временем; далее вычисляется наклон в координатах `log(t)`–`log(WOR)` и производная `dWOR/dt`.
-- Чтобы **количество скважин совпадало** в сводке MG и Chan, выбираем **единый список «допущенных» скважин** по простому правилу (как для MG): у скважины должно быть ≥{minp} валидных точек, где `fw > {thr:.2f}` и есть продолжительность периода. Chan затем внутри скважины дополнительно чистит отдельные точки, но **список скважин остаётся одним и тем же**.
-""".format(thr=SHARED_WATERCUT_THR, minp=MIN_POINTS)
+**Добавленные столбцы:**
+* `Well_calc = H + " " + I`
+* `Добыча нефти м3/мес = X * (100 - AB) / 100`
+* `Добыча воды м3/мес = X * AB / 100`
+* `ВНФ = BT / BS`
+* `Накопленное время работы = ЕСЛИ(BR[i]==BR[i-1]; AJ[i] + cum[i-1]; AJ[i])`
+* `ВНФ'` — производная по «Накопленному времени»
+"""
 st.markdown(DESCRIPTION_MD)
-
 
 # =========================
 # Утилиты
 # =========================
 def excel_letter_to_index(letter: str) -> int:
+    """A->0, B->1, ..., Z->25, AA->26, AB->27, ..."""
     letter = letter.strip().upper()
     acc = 0
     for ch in letter:
@@ -65,20 +64,34 @@ def excel_letter_to_index(letter: str) -> int:
     return acc - 1
 
 def col_by_letter(df: pd.DataFrame, letter: str) -> Optional[str]:
+    """Вернуть имя столбца по букве Excel с учётом текущего порядка колонок."""
     idx = excel_letter_to_index(letter)
     return df.columns[idx] if 0 <= idx < len(df.columns) else None
 
 def series_by_letter(df: pd.DataFrame, letter: str) -> Optional[pd.Series]:
+    """Безопасно вернуть серию по букве (или None)."""
     col = col_by_letter(df, letter)
-    return df.get(col)
+    if col is None or col not in df.columns:
+        return None
+    return df[col]
 
 def normalize_header(s: str) -> str:
     if not isinstance(s, str):
-        return str(s)
+        return s
     s = unicodedata.normalize("NFKC", s).replace("\u00A0", " ").replace("\xa0", " ")
-    return re.sub(r"\s+", " ", s.strip())
+    s = re.sub(r"\s+", " ", s.strip())
+    return s
+
+def save_df_to_excel(df: pd.DataFrame, ind: bool = False) -> BytesIO:
+    out = BytesIO()
+    df.to_excel(out, index=ind, engine="openpyxl")
+    out.seek(0)
+    return out
 
 def to_num_or_nan(ser: Optional[pd.Series], df: pd.DataFrame, fill: Optional[float] = None) -> pd.Series:
+    """
+    Вернуть числовую серию длиной df. Если ser=None — NaN (или fill, если указан).
+    """
     if isinstance(ser, pd.Series):
         out = pd.to_numeric(ser, errors="coerce")
     else:
@@ -87,6 +100,7 @@ def to_num_or_nan(ser: Optional[pd.Series], df: pd.DataFrame, fill: Optional[flo
         out = out.fillna(fill)
     return out
 
+@st.cache_data(ttl=3600)  # ← ДОБАВЬТЕ ЭТУ СТРОКУ
 def read_template_df() -> pd.DataFrame:
     try:
         if os.path.exists(TEMPLATE_PATH):
@@ -98,134 +112,131 @@ def read_template_df() -> pd.DataFrame:
 def upload_examples() -> None:
     tpl = read_template_df()
     st.write("**Скачать шаблон исходных данных:**")
-    out_excel = BytesIO()
-    tpl.to_excel(out_excel, index=False, engine="openpyxl")
-    out_excel.seek(0)
-    st.download_button(
+    c1, c2, *_ = st.columns(9)
+    c1.download_button(
+        "Скачать шаблон (CSV)",
+        data=tpl.to_csv(index=False),
+        file_name="template_from_attachment.csv",
+        mime="text/csv",
+    )
+    c2.download_button(
         "Скачать шаблон (XLSX)",
-        data=out_excel,
-        file_name="template.xlsx",
+        data=save_df_to_excel(tpl),
+        file_name="template_from_attachment.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-def safe_gradient_series(y: pd.Series, x: pd.Series) -> pd.Series:
-    """Безопасный расчёт производной: если точек < 2 — вернём NaN."""
-    y = pd.to_numeric(y, errors="coerce")
-    x = pd.to_numeric(x, errors="coerce")
-    if len(y) < 2 or len(x) < 2 or y.dropna().shape[0] < 2 or x.dropna().shape[0] < 2:
-        return pd.Series(np.nan, index=y.index, dtype=float)
-    try:
-        return pd.Series(np.gradient(y, x), index=y.index)
-    except Exception:
-        return pd.Series(np.nan, index=y.index, dtype=float)
-
-def autosize_worksheet_columns(ws, df: pd.DataFrame, startcol: int = 0):
-    """Простейший автоподбор ширины для xlsxwriter."""
-    for i, col in enumerate(df.columns):
-        width = max(len(str(col)), int(df[col].astype(str).str.len().max() or 0)) + 2
-        try:
-            ws.set_column(startcol + i, startcol + i, min(width, 60))
-        except Exception:
-            pass
-
 
 # =========================
 # Подготовка данных под MG/Chan
 # =========================
 def enforce_monotonic_per_well(dfin: pd.DataFrame) -> pd.DataFrame:
-    if dfin.empty:
-        return dfin
-    return dfin.groupby("well", sort=False, group_keys=False).apply(
-        lambda g: g.assign(t_num=g["t_num"].cummax().add(np.arange(len(g)) * EPS))
-    )
+    out = []
+    for w, g in dfin.groupby("well", sort=False):
+        t = g["t_num"].to_numpy(dtype=float)
+        for i in range(1, t.size):
+            if t[i] <= t[i - 1]:
+                t[i] = t[i - 1] + EPS
+        g2 = g.copy()
+        g2["t_num"] = t
+        out.append(g2)
+    return pd.concat(out, axis=0).reset_index(drop=True)
+
+def compute_cum_work_time(group: pd.DataFrame,
+                        col_BR: Optional[str],
+                        col_AJ: Optional[str]) -> pd.Series:
+    """
+    Накопленное время работы внутри группы Well_calc:
+    если BR[i]==BR[i-1] → AJ[i] + cum[i-1], иначе AJ[i]
+    """
+    if col_BR and col_BR in group.columns:
+        br = group[col_BR].astype(str).fillna("")
+    else:
+        br = pd.Series([""] * len(group), index=group.index)
+
+    if col_AJ and col_AJ in group.columns:
+        aj = pd.to_numeric(group[col_AJ], errors="coerce").fillna(0.0).to_numpy()
+    else:
+        aj = np.zeros(len(group), dtype=float)
+
+    out = np.zeros(len(group), dtype=float)
+    for i in range(len(group)):
+        out[i] = aj[i] if i == 0 or br.iloc[i] != br.iloc[i - 1] else aj[i] + out[i - 1]
+    return pd.Series(out, index=group.index, name="Накопленное время работы")
 
 def data_preparation(init_data: pd.DataFrame) -> pd.DataFrame:
-    df = init_data.copy()
-    df.columns = [normalize_header(c) for c in df.columns]
+    dfn = init_data.copy()
+    dfn.columns = [normalize_header(c) for c in dfn.columns]
 
-    sH  = series_by_letter(df, "H")
-    sI  = series_by_letter(df, "I")
-    sX  = series_by_letter(df, "X")
-    sAB = series_by_letter(df, "AB")
-    sBT = series_by_letter(df, "BT")
-    sBS = series_by_letter(df, "BS")
-    sBR = series_by_letter(df, "BR")
-    sAJ = series_by_letter(df, "AJ")
+    # Берём серии по буквам столбцов (устойчиво к отсутствию)
+    sH  = series_by_letter(dfn, "H")    # Скважина
+    sI  = series_by_letter(dfn, "I")    # Объект
+    sX  = series_by_letter(dfn, "X")    # Жидкость, м3/мес
+    sAB = series_by_letter(dfn, "AB")   # Обводнённость, %
+    sBT = series_by_letter(dfn, "BT")   # ВНФ числитель
+    sBS = series_by_letter(dfn, "BS")   # ВНФ знаменатель
+    sBR = series_by_letter(dfn, "BR")   # Период (ключ)
+    sAJ = series_by_letter(dfn, "AJ")   # Дни работы
 
-    # Well_calc -> well
-    well_series = pd.Series("", index=df.index, dtype=str)
-    if sH is not None:
-        well_series += sH.astype(str).str.strip().fillna("")
-    if sI is not None:
-        well_series = well_series.str.strip() + " " + sI.astype(str).str.strip().fillna("")
-    df["well"] = well_series.str.strip()
+    # Well_calc = H + " " + I
+    if sH is not None and sI is not None:
+        dfn["Well_calc"] = sH.astype(str).str.strip().fillna("") + " " + sI.astype(str).str.strip().fillna("")
+    elif sH is not None:
+        dfn["Well_calc"] = sH.astype(str).str.strip().fillna("")
+    elif sI is not None:
+        dfn["Well_calc"] = sI.astype(str).str.strip().fillna("")
+    else:
+        dfn["Well_calc"] = ""
+    dfn["well"] = dfn["Well_calc"]
 
     # Производные столбцы
-    X_vals  = to_num_or_nan(sX,  df)
-    AB_vals = to_num_or_nan(sAB, df)
-    df["Добыча нефти м3/мес"] = X_vals * (100.0 - AB_vals) / 100.0
-    df["Добыча воды м3/мес"]  = X_vals * AB_vals / 100.0
+    X_vals  = to_num_or_nan(sX,  dfn)
+    AB_vals = to_num_or_nan(sAB, dfn)
+    dfn["Добыча нефти м3/мес"] = X_vals * (100.0 - AB_vals) / 100.0
+    dfn["Добыча воды м3/мес"]  = X_vals * AB_vals / 100.0
 
-    BT_vals = to_num_or_nan(sBT, df)
-    BS_vals = to_num_or_nan(sBS, df)
+    BT_vals = to_num_or_nan(sBT, dfn)
+    BS_vals = to_num_or_nan(sBS, dfn)
     with np.errstate(divide="ignore", invalid="ignore"):
-        df["ВНФ"] = BT_vals / BS_vals
+        dfn["ВНФ"] = BT_vals / BS_vals
 
-    # Накопленное время работы
-    if sBR is not None and sAJ is not None:
-        br_series = sBR.astype(str).fillna("")
-        aj_series = pd.to_numeric(sAJ, errors="coerce").fillna(0.0)
-        new_period_marker = (df['well'] != df['well'].shift()) | (br_series != br_series.shift())
-        period_group = new_period_marker.cumsum()
-        df["Накопленное время работы"] = aj_series.groupby([df['well'], period_group]).cumsum()
-    else:
-        df["Накопленное время работы"] = 0.0
+    # Накопленное время внутри каждой Well_calc
+    cBR = col_by_letter(dfn, "BR")
+    cAJ = col_by_letter(dfn, "AJ")
+    dfn["Накопленное время работы"] = 0.0
+    for w, g in dfn.groupby("Well_calc", sort=False):
+        dfn.loc[g.index, "Накопленное время работы"] = compute_cum_work_time(g, cBR, cAJ)
 
-    # ВНФ' (безопасно)
-    df = df.sort_values(["well", "Накопленное время работы"]).reset_index(drop=True)
-    df["ВНФ'"] = (
-        df.groupby("well", sort=False)
-          .apply(lambda g: safe_gradient_series(g["ВНФ"], g["Накопленное время работы"]))
-          .reset_index(level=0, drop=True)
-    )
+    # ВНФ' — производная по накопленному времени (поштучно по Well_calc)
+    try:
+        t_all = pd.to_numeric(dfn["Накопленное время работы"], errors="coerce").to_numpy()
+        y_all = pd.to_numeric(dfn["ВНФ"], errors="coerce").to_numpy()
+        grad = np.full(len(dfn), np.nan)
+        for w, g in dfn.groupby("Well_calc", sort=False):
+            idx = g.index.to_numpy()
+            with np.errstate(invalid="ignore"):
+                grad[idx] = np.gradient(y_all[idx], t_all[idx])
+        dfn["ВНФ'"] = grad
+    except Exception:
+        dfn["ВНФ'"] = np.nan
 
     # Объёмы периода и суточные дебиты
-    df["qo_period"] = pd.to_numeric(df["Добыча нефти м3/мес"], errors="coerce").fillna(0.0)
-    df["qw_period"] = pd.to_numeric(df["Добыча воды м3/мес"],  errors="coerce").fillna(0.0)
-    df["qL_period"] = df["qo_period"] + df["qw_period"]
+    dfn["qo_period"] = pd.to_numeric(dfn["Добыча нефти м3/мес"], errors="coerce").fillna(0.0)
+    dfn["qw_period"] = pd.to_numeric(dfn["Добыча воды м3/мес"],  errors="coerce").fillna(0.0)
+    dfn["qL_period"] = dfn["qo_period"] + dfn["qw_period"]
 
-    df["prod_days"] = to_num_or_nan(sAJ, df, fill=0.0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        df["qo"] = df["qo_period"] / df["prod_days"]
-        df["qw"] = df["qw_period"] / df["prod_days"]
-        df["qL"] = df["qL_period"] / df["prod_days"]
+    prod_days = to_num_or_nan(sAJ, dfn, fill=0.0)
+    dfn["prod_days"] = prod_days
+    dfn["qo"] = np.where(dfn["prod_days"] > 0, dfn["qo_period"] / dfn["prod_days"], np.nan)
+    dfn["qw"] = np.where(dfn["prod_days"] > 0, dfn["qw_period"] / dfn["prod_days"], np.nan)
+    dfn["qL"] = np.where(dfn["prod_days"] > 0, dfn["qL_period"] / dfn["prod_days"], np.nan)
 
-    df["t_num"] = df["Накопленное время работы"]
-    df = df.dropna(subset=["well", "t_num"]).sort_values(["well", "t_num"]).reset_index(drop=True)
-    df = enforce_monotonic_per_well(df)
-    return df
+    # Время для алгоритмов
+    dfn["t_num"] = pd.to_numeric(dfn["Накопленное время работы"], errors="coerce").fillna(0.0)
 
-
-# =========================
-# Единый отбор скважин
-# =========================
-def select_eligible_wells(df: pd.DataFrame,
-                          min_points: int = MIN_POINTS,
-                          watercut_thr: float = SHARED_WATERCUT_THR) -> Set[str]:
-    """Список скважин, у которых ≥min_points валидных точек ПОСЛЕ достижения порога fw > watercut_thr."""
-    d = df.copy()
-    with np.errstate(divide="ignore", invalid="ignore"):
-        d["fw"] = d["qw_period"] / d["qL_period"]
-    d = d.replace([np.inf, -np.inf], np.nan)
-
-    eligible: Set[str] = set()
-    for w, g in d.groupby("well", sort=False):
-        g = g.sort_values("t_num")
-        mask = (g["qL_period"] > 0) & (g["fw"] > watercut_thr) & (g["prod_days"] > 0)
-        if mask.sum() >= min_points:
-            eligible.add(w)
-    return eligible
-
+    # Порядок и монотонность по скважине
+    dfn = dfn.dropna(subset=["well", "t_num"]).sort_values(["well", "t_num"]).reset_index(drop=True)
+    dfn = enforce_monotonic_per_well(dfn)
+    return dfn
 
 # =========================
 # MG
@@ -239,17 +250,10 @@ class MGFlags:
     possible_channeling: bool = False
     possible_mixed_causes: bool = False
 
-def compute_mg_full(df_in: pd.DataFrame,
-                    eligible_wells: Optional[Set[str]] = None,
-                    watercut_thr: float = SHARED_WATERCUT_THR,
-                    min_points: int = MIN_POINTS) -> pd.DataFrame:
+def compute_mg_full(df_in: pd.DataFrame, watercut_thr: float = 0.02, min_points: int = 8) -> pd.DataFrame:
     d = df_in.copy()
-    if eligible_wells is not None:
-        d = d[d["well"].isin(eligible_wells)]
-
     with np.errstate(divide="ignore", invalid="ignore"):
-        d["fw"] = d["qw_period"] / d["qL_period"]
-        d["fw"] = d["fw"].replace([np.inf, -np.inf], np.nan)
+        d["fw"] = np.where(d["qL_period"] > 0, d["qw_period"] / d["qL_period"], np.nan)
 
     frames = []
     for w, g in d.groupby("well", sort=False):
@@ -266,12 +270,14 @@ def compute_mg_full(df_in: pd.DataFrame,
         Qt_T = float(g2["Qt_cum"].iloc[-1])
         if Qt_T <= 0 or len(g2) < min_points:
             continue
-        
-        X = g2["Qt_cum"] / Qt_T
-        X_mono = X.cummax().add(np.arange(len(X)) * EPS)
-        g2["MG_X"] = X_mono
+
+        X = (g2["Qt_cum"] / Qt_T).to_numpy()
+        for i in range(1, X.size):
+            if X[i] <= X[i - 1]:
+                X[i] = X[i - 1] + EPS
+        g2["MG_X"] = X
         with np.errstate(invalid="ignore", divide="ignore"):
-            g2["MG_Y"] = g2["Qo_cum"] / g2["Qt_cum"]
+            g2["MG_Y"] = np.where(g2["Qt_cum"] > 0, g2["Qo_cum"] / g2["Qt_cum"], np.nan)
 
         flags = MGFlags()
         early_mask = g2["MG_X"] <= 0.2
@@ -281,25 +287,35 @@ def compute_mg_full(df_in: pd.DataFrame,
 
         first_third = g2[g2["MG_X"] <= 0.33]
         if len(first_third) >= 3:
+            x = first_third["MG_X"].to_numpy()
+            y = first_third["MG_Y"].to_numpy()
+            A = np.vstack([x, np.ones_like(x)]).T
             try:
-                k, _ = np.polyfit(first_third["MG_X"], first_third["MG_Y"], 1)
+                k, _ = np.linalg.lstsq(A, y, rcond=None)[0]
                 flags.slope_first_third = float(k)
                 flags.possible_channeling = (k < -0.8)
-            except np.linalg.LinAlgError:
+            except Exception:
                 pass
-        
+
         if len(g2) >= 5:
             with np.errstate(invalid="ignore"):
-                dy = np.gradient(g2["MG_Y"], g2["MG_X"])
+                dy = np.gradient(g2["MG_Y"].to_numpy(), g2["MG_X"].to_numpy())
             flags.waviness_std = float(np.nanstd(dy))
             flags.possible_mixed_causes = flags.waviness_std > 1.0
 
-        for key, val in vars(flags).items():
-            g2[f"MG_diag_{key}"] = val
-        frames.append(g2)
+        for key, val in {
+            "MG_diag_y_early_mean": flags.y_early_mean,
+            "MG_diag_slope_first_third": flags.slope_first_third,
+            "MG_diag_waviness_std": flags.waviness_std,
+            "MG_flag_behind_casing": flags.possible_behind_casing,
+            "MG_flag_channeling": flags.possible_channeling,
+            "MG_flag_mixed": flags.possible_mixed_causes,
+        }.items():
+            g2[key] = val
+
+        frames.append(g2.assign(well=w))
 
     return pd.concat(frames, axis=0).reset_index(drop=True) if frames else pd.DataFrame()
-
 
 # =========================
 # Chan
@@ -313,15 +329,9 @@ class ChanFlags:
     possible_near_wellbore: bool = False
     possible_multilayer_channeling: bool = False
 
-def compute_chan_full(df_in: pd.DataFrame,
-                      eligible_wells: Optional[Set[str]] = None,
-                      min_points: int = MIN_POINTS) -> pd.DataFrame:
+def compute_chan_full(df_in: pd.DataFrame, min_points: int = 10) -> pd.DataFrame:
     frames = []
-    d = df_in.copy()
-    if eligible_wells is not None:
-        d = d[d["well"].isin(eligible_wells)]
-
-    for w, g in d.groupby("well", sort=False):
+    for w, g in df_in.groupby("well", sort=False):
         g = g.sort_values("t_num").copy()
         with np.errstate(divide="ignore", invalid="ignore"):
             g["WOR"] = g["qw"] / g["qo"]
@@ -332,272 +342,357 @@ def compute_chan_full(df_in: pd.DataFrame,
 
         with np.errstate(invalid="ignore"):
             g["t_pos"] = g["t_num"] - g["t_num"].min() + EPS
-            g["dWOR_dt"] = np.gradient(g["WOR"], g["t_pos"])
-        
-        mask = (g["WOR"] > 0) & (g["t_pos"] > 0)
-        a = np.nan
-        if mask.sum() >= 3:
-            x = np.log(g.loc[mask, "t_pos"])
-            y = np.log(g.loc[mask, "WOR"])
-            try:
-                a, _ = np.polyfit(x, y, 1)
-            except np.linalg.LinAlgError:
-                pass
-        
-        flags = ChanFlags()
-        flags.slope_logWOR_logt = float(a)
-        flags.mean_derivative = float(np.nanmean(g["dWOR_dt"]))
-        flags.std_derivative = float(np.nanstd(g["dWOR_dt"]))
-        
-        if not np.isnan(a):
-            flags.possible_coning = a > 0.5 and flags.mean_derivative > 0
-            flags.possible_near_wellbore = a > 1.0 and flags.mean_derivative > 0
-            flags.possible_multilayer_channeling = a > 0 and flags.std_derivative > 0.1
+            g["dWOR_dt"] = np.gradient(g["WOR"].to_numpy(), g["t_pos"].to_numpy())
 
-        for key, val in vars(flags).items():
-            g[f"chan_diag_{key}"] = val
+        mask = (g["WOR"] > 0) & (g["t_pos"] > 0)
+        x = np.log(g.loc[mask, "t_pos"].to_numpy())
+        y = np.log(g.loc[mask, "WOR"].to_numpy())
+        if len(x) >= 3:
+            A = np.vstack([x, np.ones_like(x)]).T
+            try:
+                a, _ = np.linalg.lstsq(A, y, rcond=None)[0]
+            except Exception:
+                a = np.nan
+        else:
+            a = np.nan
+
+        mean_deriv = float(np.nanmean(g["dWOR_dt"])) if len(g) else np.nan
+        std_deriv  = float(np.nanstd(g["dWOR_dt"])) if len(g) else np.nan
+
+        g["well"] = w
+        g["chan_slope_logWOR_logt"] = float(a) if a == a else np.nan
+        g["chan_mean_dWOR_dt"] = mean_deriv
+        g["chan_std_dWOR_dt"] = std_deriv
+        g["chan_flag_coning"] = (a > 0.5 and mean_deriv > 0) if a == a else False
+        g["chan_flag_near_wellbore"] = (a > 1.0 and mean_deriv > 0) if a == a else False
+        g["chan_flag_multilayer_channeling"] = (a > 0 and std_deriv > 0.1) if a == a else False
+
+        # Для графика log–log показываем только положительную производную
         g["dWOR_dt_pos"] = np.where(g["dWOR_dt"] > 0, g["dWOR_dt"], np.nan)
+
         frames.append(g)
 
     return pd.concat(frames, axis=0).reset_index(drop=True) if frames else pd.DataFrame()
-
 
 # =========================
 # Текстовые диагнозы
 # =========================
 def diagnose_mg_group(g: pd.DataFrame) -> Dict[str, str]:
-    if g.empty: return {"mg_text": "нет данных MG", "mg_detail": ""}
-    last_row = g.iloc[-1]
-    y_early = last_row.get("MG_diag_y_early_mean", np.nan)
-    slope = last_row.get("MG_diag_slope_first_third", np.nan)
-    wav = last_row.get("MG_diag_waviness_std", np.nan)
+    y_early = g["MG_diag_y_early_mean"].dropna().iloc[-1] if "MG_diag_y_early_mean" in g and g["MG_diag_y_early_mean"].notna().any() else np.nan
+    slope   = g["MG_diag_slope_first_third"].dropna().iloc[-1] if "MG_diag_slope_first_third" in g and g["MG_diag_slope_first_third"].notna().any() else np.nan
+    wav     = g["MG_diag_waviness_std"].dropna().iloc[-1] if "MG_diag_waviness_std" in g and g["MG_diag_waviness_std"].notna().any() else np.nan
+    f_bc = bool(g["MG_flag_behind_casing"].dropna().iloc[-1]) if "MG_flag_behind_casing" in g and g["MG_flag_behind_casing"].notna().any() else False
+    f_ch = bool(g["MG_flag_channeling"].dropna().iloc[-1]) if "MG_flag_channeling" in g and g["MG_flag_channeling"].notna().any() else False
+    f_mix= bool(g["MG_flag_mixed"].dropna().iloc[-1]) if "MG_flag_mixed" in g and g["MG_flag_mixed"].notna().any() else False
 
     parts: List[str] = []
-    if last_row.get("MG_diag_possible_behind_casing"): parts.append("возможны заколонные перетоки (ранний нефтеотбор Y≈1)")
-    if last_row.get("MG_diag_possible_channeling"):    parts.append("признаки каналирования (крутой спад Y в первой трети)")
-    if last_row.get("MG_diag_possible_mixed_causes"):  parts.append("смешанные причины (высокая волнистость dY/dX)")
-    if not parts: parts.append("ближе к равномерному обводнению")
-    
+    if f_bc:  parts.append("возможны заколонные перетоки (ранний нефтеотбор Y≈1)")
+    if f_ch:  parts.append("признаки каналирования (крутой спад Y в первой трети)")
+    if f_mix: parts.append("смешанные причины (высокая волнистость dY/dX)")
+    if not parts: parts.append("характеристика ближе к равномерному обводнению")
+
     detail = f"MG метрики: y_early≈{y_early:.2f}; наклон≈{slope:.2f}; волнистость≈{wav:.2f}"
     return {"mg_text": "; ".join(parts), "mg_detail": detail}
 
 def diagnose_chan_group(g: pd.DataFrame) -> Dict[str, str]:
-    if g.empty: return {"chan_text": "нет данных Chan", "chan_detail": ""}
-    last_row = g.iloc[-1]
-    slope = last_row.get("chan_diag_slope_logWOR_logt", np.nan)
-    mean_d = last_row.get("chan_diag_mean_derivative", np.nan)
-    std_d = last_row.get("chan_diag_std_derivative", np.nan)
+    slope  = g["chan_slope_logWOR_logt"].dropna().iloc[-1] if "chan_slope_logWOR_logt" in g and g["chan_slope_logWOR_logt"].notna().any() else np.nan
+    mean_d = g["chan_mean_dWOR_dt"].dropna().iloc[-1] if "chan_mean_dWOR_dt" in g and g["chan_mean_dWOR_dt"].notna().any() else np.nan
+    std_d  = g["chan_std_dWOR_dt"].dropna().iloc[-1] if "chan_std_dWOR_dt" in g and g["chan_std_dWOR_dt"].notna().any() else np.nan
+    f_cone = bool(g["chan_flag_coning"].dropna().iloc[-1]) if "chan_flag_coning" in g and g["chan_flag_coning"].notna().any() else False
+    f_near = bool(g["chan_flag_near_wellbore"].dropna().iloc[-1]) if "chan_flag_near_wellbore" in g and g["chan_flag_near_wellbore"].notna().any() else False
+    f_multi= bool(g["chan_flag_multilayer_channeling"].dropna().iloc[-1]) if "chan_flag_multilayer_channeling" in g and g["chan_flag_multilayer_channeling"].notna().any() else False
 
     parts: List[str] = []
-    if last_row.get("chan_diag_possible_multilayer_channeling"): parts.append("многослойное каналирование (рост WOR и дисперсии производной)")
-    if last_row.get("chan_diag_possible_near_wellbore"):         parts.append("приствольные проблемы/ранний канал (очень высокий наклон)")
-    if last_row.get("chan_diag_possible_coning"):                parts.append("возможен конинг (наклон > 0.5 при положительной производной)")
+    if f_multi: parts.append("многослойное каналирование (рост WOR и дисперсии производной)")
+    if f_near:  parts.append("приствольные проблемы/ранний канал (очень высокий наклон)")
+    if f_cone:  parts.append("возможен конинг (наклон > 0.5 при положительной производной)")
     if not parts: parts.append("нет выраженных признаков проблемного притока воды")
-    
+
     detail = f"Chan метрики: наклон≈{slope:.2f}; средн. dWOR/dt≈{mean_d:.2e}; std≈{std_d:.2e}"
     return {"chan_text": "; ".join(parts), "chan_detail": detail}
 
+# =========================
+# Экспорт «всё в один Excel» с картинками (+ фоллбек)
+# =========================
 
-# =========================
-# Экспорт XLSX с фолбэком
-# =========================
+def _render_plot_image(kind: str, g: pd.DataFrame, well: str) -> BytesIO:
+    """Сгенерировать matplotlib-график в PNG (в памяти)."""
+    import matplotlib.pyplot as plt
+
+    buf = BytesIO()
+    if kind == "MG":
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.scatter(g["MG_X"], g["MG_Y"], s=16, label="MG: Y(X)")
+        ax.set_title(f"MG — скважина {well}")
+        ax.set_xlabel("X = Qt_cum / Qt_cum(T)")
+        ax.set_ylabel("Y = Qo_cum / Qt_cum")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+    else:  # Chan
+        fig, ax = plt.subplots(figsize=(6, 4))
+        m_wor = (g["t_pos"] > 0) & (g["WOR"] > 0)
+        m_der = (g["t_pos"] > 0) & (g["dWOR_dt_pos"] > 0)
+        ax.plot(g.loc[m_wor, "t_pos"], g.loc[m_wor, "WOR"], marker="o", linestyle="none", markersize=4, label="WOR")
+        ax.plot(g.loc[m_der, "t_pos"], g.loc[m_der, "dWOR_dt_pos"], linestyle="--", label="|dWOR/dt|")
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_xlabel("t_pos (дни)"); ax.set_ylabel("WOR, |dWOR/dt|")
+        ax.grid(True, which="both", alpha=0.3); ax.legend(loc="best")
+        ax.set_title(f"Chan — скважина {well} (log–log)")
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 def export_all_results_single_file(mg_df: pd.DataFrame,
                                    chan_df: pd.DataFrame,
                                    diagnosis_df: pd.DataFrame) -> BytesIO:
     """
-    Сначала пробуем xlsxwriter (с нативными графиками).
-    Если модуль отсутствует — фолбэк на openpyxl (без графиков).
+    Итоговый XLSX с тремя листами:
+      - Summary: сводная таблица диагнозов
+      - MG: по каждой скважине — таблица + картинка справа
+      - Chan: по каждой скважине — таблица + картинка справа
     """
-    output = BytesIO()
-
-    # --- Попытка 1: xlsxwriter
+    
+    # ЛЕНИВАЯ ЗАГРУЗКА тяжёлых библиотек только при вызове функции
     try:
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            wb = writer.book
+        import xlsxwriter
+        use_xlsxwriter = True
+    except ImportError:
+        use_xlsxwriter = False
+    
+    # Вызов соответствующей реализации
+    if use_xlsxwriter:
+        return _export_with_xlsxwriter(mg_df, chan_df, diagnosis_df)
+    else:
+        return _export_with_openpyxl(mg_df, chan_df, diagnosis_df)
 
-            # Summary
+
+def _export_with_xlsxwriter(mg_df: pd.DataFrame,
+                            chan_df: pd.DataFrame,
+                            diagnosis_df: pd.DataFrame) -> BytesIO:
+    """Реализация с xlsxwriter"""
+    import xlsxwriter  # Импорт внутри функции!
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        # Summary
+        if diagnosis_df is not None and not diagnosis_df.empty:
             diagnosis_df.to_excel(writer, sheet_name="Summary", index=False)
-            autosize_worksheet_columns(writer.sheets["Summary"], diagnosis_df)
+            writer.sheets["Summary"].set_column(0, diagnosis_df.shape[1]-1, 18)
+        else:
+            ws = writer.book.add_worksheet("Summary")
+            ws.write(0, 0, "Нет сводных диагнозов")
 
-            # MG
-            ws_mg = wb.add_worksheet("MG"); writer.sheets["MG"] = ws_mg
-            row = 0
-            if not mg_df.empty:
-                for well, g in mg_df.groupby("well", sort=False):
-                    ws_mg.write(row, 0, f"Скважина {well} — MG")
-                    row += 1
-                    g0 = g.reset_index(drop=True)
-                    g0.to_excel(writer, sheet_name="MG", index=False, startrow=row)
-                    autosize_worksheet_columns(ws_mg, g0)
-                    # график
-                    chart = wb.add_chart({'type': 'scatter'})
-                    n = len(g0)
-                    cx = g0.columns.get_loc("MG_X") + 1
-                    cy = g0.columns.get_loc("MG_Y") + 1
-                    chart.add_series({
-                        'name': f'Скважина {well}',
-                        'categories': ['MG', row + 1, cx, row + n, cx],
-                        'values':     ['MG', row + 1, cy, row + n, cy],
-                        'marker': {'type': 'circle', 'size': 5},
-                    })
-                    chart.set_title({'name': f'MG — Скважина {well}'})
-                    chart.set_x_axis({'name': 'X = Qt_cum / Qt_cum(T)'})
-                    chart.set_y_axis({'name': 'Y = Qo_cum / Qt_cum'})
-                    chart.set_legend({'position': 'none'})
-                    ws_mg.insert_chart(row, g0.shape[1] + 1, chart)
-                    row += n + 5
-            else:
-                ws_mg.write(0, 0, "Нет данных MG")
+        # MG
+        ws_mg = writer.book.add_worksheet("MG"); writer.sheets["MG"] = ws_mg
+        cur = 0
+        if mg_df is not None and not mg_df.empty:
+            for well, g in mg_df.groupby("well", sort=False):
+                title = f"Скважина {well} — MG"
+                g_reset = g.reset_index(drop=True)
+                g_reset.to_excel(writer, sheet_name="MG", index=False, startrow=cur+1, startcol=0)
+                ws_mg.write(cur, 0, title)
+                ws_mg.set_column(0, min(8, g_reset.shape[1]-1), 14)
+                if g_reset.shape[1] > 9: ws_mg.set_column(9, g_reset.shape[1]-1, 16)
+                img = _render_plot_image("MG", g, well)
+                ws_mg.insert_image(cur+1, 9, f"MG_{well}.png", {"image_data": img})
+                cur = cur + 1 + len(g_reset) + 4
+        else:
+            ws_mg.write(0, 0, "Нет данных MG")
 
-            # Chan
-            ws_ch = wb.add_worksheet("Chan"); writer.sheets["Chan"] = ws_ch
-            row = 0
-            if not chan_df.empty:
-                for well, g in chan_df.groupby("well", sort=False):
-                    ws_ch.write(row, 0, f"Скважина {well} — Chan")
-                    row += 1
-                    g0 = g.reset_index(drop=True)
-                    g0.to_excel(writer, sheet_name="Chan", index=False, startrow=row)
-                    autosize_worksheet_columns(ws_ch, g0)
-                    chart = wb.add_chart({'type': 'scatter', 'subtype': 'straight_with_markers'})
-                    n = len(g0)
-                    ct = g0.columns.get_loc("t_pos") + 1
-                    cw = g0.columns.get_loc("WOR") + 1
-                    cd = g0.columns.get_loc("dWOR_dt_pos") + 1
-                    chart.add_series({
-                        'name': 'WOR',
-                        'categories': ['Chan', row + 1, ct, row + n, ct],
-                        'values':     ['Chan', row + 1, cw, row + n, cw],
-                        'marker': {'type': 'circle', 'size': 5},
-                        'line': {'none': True},
-                    })
-                    chart.add_series({
-                        'name': '|dWOR/dt|',
-                        'categories': ['Chan', row + 1, ct, row + n, ct],
-                        'values':     ['Chan', row + 1, cd, row + n, cd],
-                        'marker': {'type': 'none'},
-                        'line': {'dash_type': 'dash'},
-                    })
-                    chart.set_title({'name': f'Chan — Скважина {well}'})
-                    chart.set_x_axis({'name': 't_pos (дни)', 'log_base': 10})
-                    chart.set_y_axis({'name': 'WOR, |dWOR/dt|', 'log_base': 10})
-                    ws_ch.insert_chart(row, g0.shape[1] + 1, chart)
-                    row += n + 5
-            else:
-                ws_ch.write(0, 0, "Нет данных Chan")
-
-    # --- Попытка 2: openpyxl (без графиков)
-    except ModuleNotFoundError:
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            diagnosis_df.to_excel(writer, sheet_name="Summary", index=False)
-            if not mg_df.empty:
-                mg_df.to_excel(writer, sheet_name="MG", index=False)
-            if not chan_df.empty:
-                chan_df.to_excel(writer, sheet_name="Chan", index=False)
-
+        # Chan
+        ws_ch = writer.book.add_worksheet("Chan"); writer.sheets["Chan"] = ws_ch
+        cur = 0
+        if chan_df is not None and not chan_df.empty:
+            for well, g in chan_df.groupby("well", sort=False):
+                title = f"Скважина {well} — Chan"
+                g_reset = g.reset_index(drop=True)
+                g_reset.to_excel(writer, sheet_name="Chan", index=False, startrow=cur+1, startcol=0)
+                ws_ch.write(cur, 0, title)
+                ws_ch.set_column(0, min(8, g_reset.shape[1]-1), 14)
+                if g_reset.shape[1] > 9: ws_ch.set_column(9, g_reset.shape[1]-1, 16)
+                img = _render_plot_image("Chan", g, well)
+                ws_ch.insert_image(cur+1, 9, f"Chan_{well}.png", {"image_data": img})
+                cur = cur + 1 + len(g_reset) + 4
+        else:
+            ws_ch.write(0, 0, "Нет данных Chan")
     output.seek(0)
     return output
 
+def _export_with_openpyxl(mg_df: pd.DataFrame,
+                        chan_df: pd.DataFrame,
+                        diagnosis_df: pd.DataFrame) -> BytesIO:
+    """
+    Фоллбек-экспорт без xlsxwriter: чистый openpyxl (+ Pillow).
+    Картинки тоже вставляем (в ячейку J<row>).
+    """
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    from openpyxl.drawing.image import Image as XLImage
+    from PIL import Image as PILImage  # ⚠️ ТЕПЕРЬ ЗДЕСЬ!
+    wb = Workbook()
+
+    # Summary
+    ws = wb.active
+    ws.title = "Summary"
+    if diagnosis_df is not None and not diagnosis_df.empty:
+        for r in dataframe_to_rows(diagnosis_df, index=False, header=True):
+            ws.append(r)
+    else:
+        ws.cell(row=1, column=1, value="Нет сводных диагнозов")
+
+    # MG
+    ws_mg = wb.create_sheet("MG")
+    cur = 1
+    if mg_df is not None and not mg_df.empty:
+        for well, g in mg_df.groupby("well", sort=False):
+            ws_mg.cell(row=cur, column=1, value=f"Скважина {well} — MG")
+            cur += 1
+            g_reset = g.reset_index(drop=True)
+            # таблица
+            for r in dataframe_to_rows(g_reset, index=False, header=True):
+                ws_mg.append(r)
+            # картинка
+            img_buf = _render_plot_image("MG", g, well)
+            pil_img = PILImage.open(img_buf)
+            xl_img = XLImage(pil_img)
+            xl_img.anchor = f"J{cur}"
+            ws_mg.add_image(xl_img)
+            cur = cur + len(g_reset) + 4
+    else:
+        ws_mg.cell(row=1, column=1, value="Нет данных MG")
+
+    # Chan
+    ws_ch = wb.create_sheet("Chan")
+    cur = 1
+    if chan_df is not None and not chan_df.empty:
+        for well, g in chan_df.groupby("well", sort=False):
+            ws_ch.cell(row=cur, column=1, value=f"Скважина {well} — Chan")
+            cur += 1
+            g_reset = g.reset_index(drop=True)
+            for r in dataframe_to_rows(g_reset, index=False, header=True):
+                ws_ch.append(r)
+            img_buf = _render_plot_image("Chan", g, well)
+            pil_img = PILImage.open(img_buf)
+            xl_img = XLImage(pil_img)
+            xl_img.anchor = f"J{cur}"
+            ws_ch.add_image(xl_img)
+            cur = cur + len(g_reset) + 4
+    else:
+        ws_ch.cell(row=1, column=1, value="Нет данных Chan")
+
+    # Сохранение в память
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
 
 # =========================
 # Основной UI/поток
 # =========================
 def main() -> None:
+    # Кнопки скачивания шаблона
     upload_examples()
-    uploaded_file = st.file_uploader(label="**Загрузите XLSX/XLS файл для расчёта**", type=["xlsx", "xls"])
+
+    # Загрузка данных
+    uploaded_file = st.file_uploader(label="**Загрузите данные для расчёта**", accept_multiple_files=False)
     if uploaded_file is None:
-        st.info("Пожалуйста, загрузите файл, созданный на основе шаблона.")
+        st.info("Поддерживаются .csv, .txt, .xls, .xlsx")
         return
 
-    try:
-        with st.spinner("Чтение и обработка данных..."):
-            df_raw = pd.read_excel(uploaded_file)
-            df = data_preparation(df_raw)
+    if uploaded_file.name.lower().endswith((".txt", ".csv")):
+        df_raw = pd.read_csv(uploaded_file)
+    elif uploaded_file.name.lower().endswith((".xls", ".xlsx")):
+        df_raw = pd.read_excel(uploaded_file)
+    else:
+        st.error("Неверный формат данных. Загрузите .csv, .txt, .xls, .xlsx")
+        return
 
-        # единый список скважин
-        eligible = select_eligible_wells(df, min_points=MIN_POINTS, watercut_thr=SHARED_WATERCUT_THR)
+    # Подготовка
+    df = data_preparation(df_raw)
 
-        with st.spinner("Расчёт по методике Меркуловой–Гинзбурга..."):
-            mg_df = compute_mg_full(df, eligible_wells=eligible)
-        st.success(f"✔️ MG: расчёт выполнен для {len(eligible)} скважин.")
+    # MG
+    mg_df = compute_mg_full(df)
+    st.text(f"[OK] MG рассчитан: строк {len(mg_df)}; скважин {mg_df['well'].nunique() if not mg_df.empty else 0}")
 
-        with st.spinner("Расчёт по методике Chan..."):
-            chan_df = compute_chan_full(df, eligible_wells=eligible)
-        st.success(f"✔️ Chan: расчёт выполнен для {len(eligible)} скважин.")
+    # Chan
+    chan_df = compute_chan_full(df)
+    st.text(f"[OK] Chan рассчитан: строк {len(chan_df)}; скважин {chan_df['well'].nunique() if not chan_df.empty else 0}")
 
-        rows: List[Dict[str, str]] = []
-        all_wells = sorted(list(eligible))
-        if not all_wells:
-            st.warning("Не найдено скважин для анализа. Проверьте входной файл.")
-            return
+    # Вывод по скважинам + сбор сводки
+    rows: List[Dict[str, str]] = []
+    wells_mg = set(mg_df["well"].unique() if not mg_df.empty else [])
+    wells_ch = set(chan_df["well"].unique() if not chan_df.empty else [])
+    all_wells = sorted(list(wells_mg.union(wells_ch)))
 
-        for w in all_wells:
-            mg_g = mg_df[mg_df["well"] == w] if not mg_df.empty else pd.DataFrame()
-            ch_g = chan_df[chan_df["well"] == w] if not chan_df.empty else pd.DataFrame()
+    for w in all_wells:
+        mg_g = mg_df[mg_df["well"] == w] if not mg_df.empty else pd.DataFrame()
+        ch_g = chan_df[chan_df["well"] == w] if not chan_df.empty else pd.DataFrame()
 
-            mg_diag = diagnose_mg_group(mg_g)
-            ch_diag = diagnose_chan_group(ch_g)
-            rows.append({"well": w, **mg_diag, **ch_diag})
+        mg_diag = diagnose_mg_group(mg_g) if not mg_g.empty else {"mg_text": "нет данных MG", "mg_detail": ""}
+        ch_diag = diagnose_chan_group(ch_g) if not ch_g.empty else {"chan_text": "нет данных Chan", "chan_detail": ""}
 
-            with st.expander(f"Диагноз и графики для скважины: {w}"):
-                st.markdown(f"#### 📜 Диагноз: {w}")
-                col1, col2 = st.columns(2)
-                col1.metric("Диагноз MG", mg_diag['mg_text'], help=mg_diag['mg_detail'])
-                col2.metric("Диагноз Chan", ch_diag['chan_text'], help=ch_diag['chan_detail'])
+        st.markdown(f'<h2 style="color: darkred;">Скважина {w}</h2>', unsafe_allow_html=True)
+        st.text(f"  MG:   {mg_diag['mg_text']}")
+        if mg_diag["mg_detail"]:
+            st.text(f"        {mg_diag['mg_detail']}")
+        st.text(f"  Chan: {ch_diag['chan_text']}")
+        if ch_diag["chan_detail"]:
+            st.text(f"        {ch_diag['chan_detail']}")
 
-                st.markdown(f"#### 📈 Графики: {w}")
-                plot_col1, plot_col2 = st.columns(2)
+        rows.append({"well": w, **mg_diag, **ch_diag})
 
-                with plot_col1:
-                    if not mg_g.empty:
-                        fig_mg, ax_mg = plt.subplots()
-                        ax_mg.scatter(mg_g["MG_X"], mg_g["MG_Y"], s=16)
-                        ax_mg.set_title(f"MG — скважина {w}")
-                        ax_mg.set_xlabel("X = Qt_cum / Qt_cum(T)")
-                        ax_mg.set_ylabel("Y = Qo_cum / Qt_cum")
-                        ax_mg.grid(True, alpha=0.3)
-                        st.pyplot(fig_mg)
-                    else:
-                        st.info(f"Нет данных MG для {w}")
+        # --- График MG ---
+        st.markdown(f"##### MG-график (Y vs X) — скважина {w}")
+        st.text("Кривая показывает долю накопленной нефти (Y) от накопленной жидкости при увеличении доли накопленной жидкости (X).")
+        if not mg_g.empty:
+            fig_mg, ax_mg = plt.subplots(figsize=(7, 4))
+            ax_mg.scatter(mg_g["MG_X"], mg_g["MG_Y"], label="MG: Y(X)", s=16)
+            ax_mg.set_title(f"MG — скважина {w}")
+            ax_mg.set_xlabel("X = Qt_cum / Qt_cum(T)")
+            ax_mg.set_ylabel("Y = Qo_cum / Qt_cum")
+            ax_mg.grid(True, alpha=0.3)
+            ax_mg.legend(loc="best")
+            st.pyplot(fig_mg, use_container_width=False)
+        else:
+            st.text(f"  [!] Нет данных MG для скважины {w}")
 
-                with plot_col2:
-                    if not ch_g.empty:
-                        fig_chan, ax = plt.subplots()
-                        ax.plot(ch_g["t_pos"], ch_g["WOR"], "o", markersize=4, label="WOR")
-                        ax.plot(ch_g["t_pos"], ch_g["dWOR_dt_pos"], "--", label="|dWOR/dt|")
-                        ax.set_xscale("log"); ax.set_yscale("log")
-                        ax.set_xlabel("t_pos (дни)"); ax.set_ylabel("WOR, |dWOR/dt|")
-                        ax.grid(True, which="both", alpha=0.3); ax.legend()
-                        ax.set_title(f"Chan — скважина {w} (log–log)")
-                        st.pyplot(fig_chan)
-                    else:
-                        st.info(f"Нет данных Chan для {w}")
+        # --- График Chan: одна ось, обе шкалы log ---
+        st.markdown(f"##### Chan-график (WOR и |dWOR/dt|) — скважина {w} (log–log)")
+        st.text("Обе кривые на одном графике; оси X и Y — логарифмические. Для производной отображаются только положительные значения.")
+        if not ch_g.empty:
+            fig_chan, ax = plt.subplots(figsize=(7, 4))
+            m_wor = (ch_g["t_pos"] > 0) & (ch_g["WOR"] > 0)
+            m_der = (ch_g["t_pos"] > 0) & (ch_g["dWOR_dt_pos"] > 0)
+            ax.plot(ch_g.loc[m_wor, "t_pos"], ch_g.loc[m_wor, "WOR"], marker="o", linestyle="none", label="WOR", markersize=4)
+            ax.plot(ch_g.loc[m_der, "t_pos"], ch_g.loc[m_der, "dWOR_dt_pos"], linestyle="--", label="|dWOR/dt|")
+            ax.set_xscale("log"); ax.set_yscale("log")
+            ax.set_xlabel("t_pos (дни)"); ax.set_ylabel("WOR, |dWOR/dt|")
+            ax.grid(True, which="both", alpha=0.3); ax.legend(loc="best")
+            ax.set_title(f"Chan — скважина {w} (log–log)")
+            st.pyplot(fig_chan, use_container_width=False)
+        else:
+            st.text(f"  [!] Нет данных Chan для скважины {w}")
 
-        diagnosis_df = pd.DataFrame(rows).sort_values("well").reset_index(drop=True)
-        if not diagnosis_df.empty:
-            st.markdown("---")
-            st.subheader("Сводная таблица диагнозов")
-            st.dataframe(diagnosis_df)
+    diagnosis_df = pd.DataFrame(rows).sort_values("well").reset_index(drop=True)
+    if not diagnosis_df.empty:
+        st.markdown(f'<h2 style="color: darkred;">СВОДНАЯ ТАБЛИЦА ДИАГНОЗОВ</h2>', unsafe_allow_html=True)
+        st.table(diagnosis_df)
+    else:
+        st.text("\n[!] Не сформировано ни одного диагноза (возможно, после фильтрации мало валидных точек).")
 
-        st.markdown("---")
-        st.subheader("📥 Скачать результаты")
-        result_bytes = export_all_results_single_file(mg_df, chan_df, diagnosis_df)
-        st.download_button(
-            label="Скачать единый Excel-файл (таблицы + графики*)",
-            data=result_bytes,
-            file_name="Autodiagnostics_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="*Графики встраиваются, если установлен модуль xlsxwriter; иначе создаётся файл без графиков.",
-        )
-
-    except Exception as e:
-        st.error(f"Произошла ошибка при обработке файла: {e}")
-        st.warning("Убедитесь, что структура файла соответствует шаблону.")
+    # ЕДИНЫЙ EXCEL (Summary + MG + Chan) с графиками
+    result_bytes = export_all_results_single_file(mg_df, chan_df, diagnosis_df)
+    st.download_button(
+        label="Скачать единый файл результатов (Summary + MG + Chan)",
+        data=result_bytes,
+        file_name="Autodiagnostics_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 # =========================
 # Точка входа
 # =========================
 if __name__ == "__main__":
     main()
-
