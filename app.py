@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import io, os, re, unicodedata
+import io, re, unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 # ========================
-# Глобальные настройки
+# Константы/настройки
 # ========================
 EPS = 1e-9
 MIN_POINTS_DEFAULT = 6
@@ -23,16 +23,17 @@ APP_TITLE = "Поскважинный автодиагноз (Chan & Мерку�
 st.set_page_config(layout="wide", page_title="Автодиагностика скважин", page_icon="🛢️")
 
 # ========================
-# Описание + шаблоны
+# Текст и шаблоны
 # ========================
 st.markdown(f"""
 # {APP_TITLE}
 
-- Входной файл должен содержать **Скважина** и **Пласт**. Если чего-то нет — столбцы создаются автоматически.
-- Ключ анализа: **`well_id = "Скважина | Пласт"`** — все расчёты, фильтры, графики и экспорт ведутся по нему.
-- Поддерживаются входы:  
-  ① *Жидкость (сут)* + *Обводнённость, %*; ② *Qo (сут)* + *Qw (сут)*; ③ *Qo(мес)* + *Qw(мес)*; ④ *Qж(мес)* + *Обводнённость, %*.  
-  Дни добычи (*Дни добычи*) — опционально (если нет, берём 1).
+- Входной файл должен содержать **Скважина** и **Пласт**. Если их нет — приложение создаст столбцы автоматически.
+- Ключ анализа: **`well_id = "Скважина | Пласт"`** — все допуски, расчёты и графики ведутся по нему.
+- Поддерживаемые входы:  
+  ① *Жидкость (сут)* + *Обводнённость, %*; ② *Qo (сут)* + *Qw (сут)*;  
+  ③ *Qo(мес)* + *Qw(мес)*; ④ *Qж(мес)* + *Обводнённость, %*.  
+  *Дни добычи* (если нет — берём 1).
 """)
 
 def _template_liq_wc() -> pd.DataFrame:
@@ -70,41 +71,45 @@ c3.download_button("🔽 Шаблон (Qo/Qw) — XLSX", data=_bytes_xlsx(_templ
 st.markdown("---")
 
 # ========================
-# Утилиты распознавания
+# Вспомогалки
 # ========================
 def _drop_unnamed(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
 
+def _bytes_of_upload(f) -> bytes:
+    f.seek(0); b=f.read(); f.seek(0); return b
+
 def _norm_text(s: str) -> str:
     s = str(s)
-    s = s.replace("ё", "е").replace("Ё","Е")
-    s = unicodedata.normalize("NFKC", s)
-    s = s.lower()
+    s = s.replace("ё","е").replace("Ё","Е")
+    s = unicodedata.normalize("NFKC", s).lower()
     s = re.sub(r"\s+", "", s)
-    s = re.sub(r"[^\w]+", "", s)  # убрать пунктуацию
+    s = re.sub(r"[^\w]+", "", s)
     return s
 
 def _norm_cols(df: pd.DataFrame) -> Dict[str,str]:
-    # map normalized -> original
     return {_norm_text(c): c for c in df.columns}
 
 def _find_col(normmap: Dict[str,str], variants: List[str]) -> Optional[str]:
     for v in variants:
         if v in normmap: return normmap[v]
-    # частичное совпадение
-    for key, orig in normmap.items():
-        if any(v in key for v in variants):
-            return orig
+    for k,orig in normmap.items():
+        if any(v in k for v in variants): return orig
     return None
 
 def _to_num_series(s: pd.Series, fill=None) -> pd.Series:
-    # поддержка десятичной запятой и пробелов
-    txt = s.astype(str).str.replace("\u00A0"," ").str.replace(" ","", regex=False).str.replace(",",".", regex=False)
+    txt = s.astype(str).str.replace("\u00A0"," ").str.replace(" ", "", regex=False).str.replace(",", ".", regex=False)
     out = pd.to_numeric(txt, errors="coerce")
     return out.fillna(fill) if fill is not None else out
 
-def _bytes_of_upload(f) -> bytes:
-    f.seek(0); b=f.read(); f.seek(0); return b
+def _fmt(x, fmt="{:.2f}") -> str:
+    """Безопасное форматирование чисел для f-string."""
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):  # NaN
+            return "—"
+        return fmt.format(float(x))
+    except Exception:
+        return "—"
 
 # ========================
 # Чтение файла
@@ -125,7 +130,7 @@ def read_user_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
     raise ValueError(f"Не удалось прочитать файл: {last_exc}")
 
 # ========================
-# Подготовка: Скважина/Пласт → well_id и численные поля
+# Подготовка данных: well_id, поля, время
 # ========================
 def _ensure_well_layer(df: pd.DataFrame) -> pd.DataFrame:
     nm = _norm_cols(df)
@@ -155,38 +160,38 @@ def prepare_data(file_bytes: bytes, filename: str) -> Tuple[pd.DataFrame, Dict[s
     raw.columns = [str(c) for c in raw.columns]
     df = _ensure_well_layer(raw)
     nm = _norm_cols(df)
-
-    # детектор колонок
     det: Dict[str,str] = {}
 
-    # даты/накопленное время
+    # время
     c_date = _find_col(nm, ["дата","месяц","period","monthyear"])
     c_tcum = _find_col(nm, ["накопленноевремиработы","накопленноевремени","накопленноевремяработы","taccum"])
-
-    # дни
     c_days = _find_col(nm, ["днидобычи","числоднейдобычинефтисут","proddays","aj","сут"])
 
-    # периодные объёмы
-    c_qoP = _find_col(nm, ["добычанефтим3мес","qoperiod","qo_mo","qo_mm","qo_q"])
-    c_qwP = _find_col(nm, ["добычаводым3мес","qwperiod","qw_mo","qw_mm","qw_q"])
-    c_qL_P = _find_col(nm, ["добыкажидкостим3мес","жидкостьм3мес","qlperiod","ql_mo","qL_mo"])
+    # периодные и суточные поля
+    c_qoP = _find_col(nm, ["добычанефтим3мес","qoperiod"])
+    c_qwP = _find_col(nm, ["добычаводым3мес","qwperiod"])
+    c_qL_P = _find_col(nm, ["добыкажидкостим3мес","жидкостьм3мес","qlperiod"])
 
-    # суточные
     c_liq = _find_col(nm, ["жидкостьм3сут","дебитжидкостим3сут","liquid","ql"])
     c_wc  = _find_col(nm, ["обводненность","обводненностьпроцент","watercut","wc","ab"])
     c_qo  = _find_col(nm, ["дебитнефтим3сут","qo","oilrate"])
     c_qw  = _find_col(nm, ["дебитводым3сут","qw","waterrate"])
 
+    # 1) QoP/QwP
     if c_qoP and c_qwP:
         df["qo_period"] = _to_num_series(df[c_qoP], 0.0); det["qo_period"]=c_qoP
         df["qw_period"] = _to_num_series(df[c_qwP], 0.0); det["qw_period"]=c_qwP
         df["qL_period"] = df["qo_period"] + df["qw_period"]
+        df["qo"] = np.nan; df["qw"] = np.nan; df["qL"] = np.nan
+    # 2) QL_period + WC
     elif c_qL_P and c_wc:
         qL = _to_num_series(df[c_qL_P], 0.0); det["qL_period"]=c_qL_P
         wc = _to_num_series(df[c_wc], 0.0);   det["watercut"]=c_wc
         df["qo_period"] = qL * (100.0 - wc)/100.0
         df["qw_period"] = qL * wc/100.0
         df["qL_period"] = qL
+        df["qo"] = np.nan; df["qw"] = np.nan; df["qL"] = np.nan
+    # 3) Liq + WC (суточные)
     elif c_liq and c_wc:
         liq = _to_num_series(df[c_liq], 0.0); det["liq"]=c_liq
         wc  = _to_num_series(df[c_wc], 0.0);  det["watercut"]=c_wc
@@ -199,6 +204,7 @@ def prepare_data(file_bytes: bytes, filename: str) -> Tuple[pd.DataFrame, Dict[s
         df["qo_period"] = df["qo"] * days
         df["qw_period"] = df["qw"] * days
         df["qL_period"] = df["qL"] * days
+    # 4) Qo/Qw (суточные)
     elif c_qo and c_qw:
         df["qo"] = _to_num_series(df[c_qo], 0.0); det["qo"]=c_qo
         df["qw"] = _to_num_series(df[c_qw], 0.0); det["qw"]=c_qw
@@ -210,29 +216,31 @@ def prepare_data(file_bytes: bytes, filename: str) -> Tuple[pd.DataFrame, Dict[s
         df["qw_period"] = df["qw"] * days
         df["qL_period"] = df["qL"] * days
     else:
-        # минимально жизнеспособный фолбэк
+        # фолбэк: нули, чтобы не падать
         days = _to_num_series(df[c_days], 1.0) if c_days else pd.Series(1.0, index=df.index)
         if c_days: det["prod_days"]=c_days
         df["prod_days"] = days
         df["qo_period"] = pd.Series(0.0, index=df.index)
         df["qw_period"] = pd.Series(0.0, index=df.index)
         df["qL_period"] = pd.Series(0.0, index=df.index)
+        df["qo"] = np.nan; df["qw"] = np.nan; df["qL"] = np.nan
 
-    # время
+    # t_num
     if c_tcum:
         df["t_num"] = _to_num_series(df[c_tcum], 0.0); det["t_num"]=c_tcum
     elif c_date:
         t = pd.to_datetime(df[c_date], errors="coerce"); det["date"]=c_date
         df["t_num"] = (t - t.groupby(df["well_id"]).transform("min")).dt.days.astype(float).fillna(0.0)
     else:
-        df["t_num"] = df["prod_days"].groupby(df["well_id"]).cumsum(); det["t_num"]="cum(prod_days)"
+        df["t_num"] = df.get("prod_days", pd.Series(1.0, index=df.index)).groupby(df["well_id"]).cumsum()
+        det["t_num"]="cum(prod_days)"
 
     df = df.dropna(subset=["well_id","t_num"]).sort_values(["well_id","t_num"]).reset_index(drop=True)
     df = enforce_monotonic(df)
     return df, det
 
 # ========================
-# Отбор сущностей + причины
+# Отбор сущностей
 # ========================
 @st.cache_data
 def select_eligible_with_reasons(df: pd.DataFrame, min_points: int, watercut_thr: float) -> Tuple[Tuple[str,...], Dict[str,str]]:
@@ -255,7 +263,7 @@ def select_eligible_with_reasons(df: pd.DataFrame, min_points: int, watercut_thr
     return tuple(elig), reasons
 
 # ========================
-# MG/Chan
+# MG/Chan вычисления
 # ========================
 @dataclass
 class MGFlags:
@@ -306,6 +314,7 @@ def compute_mg(df: pd.DataFrame, ids: Tuple[str,...], thr: float, minp:int) -> p
                 dy=np.gradient(g2["MG_Y"].to_numpy(), g2["MG_X"].to_numpy())
             flags.waviness_std=float(np.nanstd(dy))
             flags.possible_mixed_causes=flags.waviness_std>1.0
+
         for k,v in vars(flags).items():
             g2[f"MG_diag_{k}"]=v
         outs.append(g2)
@@ -328,7 +337,7 @@ def compute_chan(df: pd.DataFrame, ids: Tuple[str,...], minp:int) -> pd.DataFram
     for wid,g in d.groupby("well_id", sort=False):
         g=g.sort_values("t_num").copy()
         with np.errstate(divide="ignore", invalid="ignore"):
-            g["WOR"]=g["qw"]/g["qo"]
+            g["WOR"]=g.get("qw")/g.get("qo")
         g=g.replace([np.inf,-np.inf], np.nan)
         g=g[(g["qo"]>0)&(g["WOR"]>0)].dropna(subset=["WOR"])
         if len(g)<minp: continue
@@ -356,7 +365,7 @@ def compute_chan(df: pd.DataFrame, ids: Tuple[str,...], minp:int) -> pd.DataFram
     return pd.concat(outs,axis=0).reset_index(drop=True) if outs else pd.DataFrame(columns=["well_id","t_pos","WOR","dWOR_dt","dWOR_dt_pos"])
 
 # ========================
-# Диагнозы
+# Диагнозы (безопасное форматирование)
 # ========================
 def diag_mg(g: pd.DataFrame)->Dict[str,str]:
     if g.empty: return {"mg_text":"нет данных MG","mg_detail":""}
@@ -365,10 +374,12 @@ def diag_mg(g: pd.DataFrame)->Dict[str,str]:
     if r.get("MG_diag_possible_channeling"):    parts.append("признаки каналирования (крутой спад Y в первой трети)")
     if r.get("MG_diag_possible_mixed_causes"):  parts.append("смешанные причины (высокая волнистость dY/dX)")
     if not parts: parts.append("ближе к равномерному обводнению")
-    return {"mg_text":"; ".join(parts),
-            "mg_detail":f"MG: y_early≈{r.get('MG_diag_y_early_mean',np.nan):.2f}; "
-                        f"k≈{r.get('MG_diag_slope_first_third',np.nan):.2f}; "
-                        f"std(dY/dX)≈{r.get('MG_diag_waviness_std',np.nan):.2f}"}
+    return {
+        "mg_text":"; ".join(parts),
+        "mg_detail":f"MG: y_early≈{_fmt(r.get('MG_diag_y_early_mean'))}; "
+                    f"k≈{_fmt(r.get('MG_diag_slope_first_third'))}; "
+                    f"std(dY/dX)≈{_fmt(r.get('MG_diag_waviness_std'))}"
+    }
 
 def diag_chan(g: pd.DataFrame)->Dict[str,str]:
     if g.empty: return {"chan_text":"нет данных Chan","chan_detail":""}
@@ -377,10 +388,12 @@ def diag_chan(g: pd.DataFrame)->Dict[str,str]:
     if r.get("chan_diag_possible_near_wellbore"):         parts.append("приствольные проблемы/ранний канал")
     if r.get("chan_diag_possible_coning"):                parts.append("возможен конинг (наклон > 0.5)")
     if not parts: parts.append("нет выраженных признаков проблемного притока воды")
-    return {"chan_text":"; ".join(parts),
-            "chan_detail":f"Chan: slope≈{r.get('chan_diag_slope_logWOR_logt',np.nan):.2f}; "
-                          f"mean dWOR/dt≈{r.get('chan_diag_mean_derivative',np.nan):.2e}; "
-                          f"std≈{r.get('chan_diag_std_derivative',np.nan):.2e}"}
+    return {
+        "chan_text":"; ".join(parts),
+        "chan_detail":f"Chan: slope≈{_fmt(r.get('chan_diag_slope_logWOR_logt'))}; "
+                      f"mean dWOR/dt≈{_fmt(r.get('chan_diag_mean_derivative'), '{:.2e}')}; "
+                      f"std≈{_fmt(r.get('chan_diag_std_derivative'), '{:.2e}')}"
+    }
 
 # ========================
 # Экспорт
@@ -417,7 +430,6 @@ else:
         with st.spinner("Подготовка данных..."):
             df, detector = prepare_data(b, uploaded.name)
 
-        # Диагностика распознанных полей
         with st.expander("🔍 Диагностика распознанных колонок"):
             st.json(detector)
 
@@ -442,27 +454,43 @@ else:
         st.subheader("Сводная таблица диагнозов")
         st.dataframe(summary, use_container_width=True)
 
+        # Графики — строго внутри скрывающихся экспандеров; рисуем только при наличии данных
         st.subheader("Графики (ограниченный список)")
         show_ids = eligible_ids[:max_plot]
-        cols = st.columns(2)
-        for i,wid in enumerate(show_ids):
-            with st.expander(f"{wid} — графики"):
+        for wid in show_ids:
+            with st.expander(f"{wid} — графики (MG и Chan)"):
+                left, right = st.columns(2)
+
                 mg_g = mg_df[mg_df["well_id"]==wid] if ("well_id" in mg_df.columns) else pd.DataFrame()
                 ch_g = chan_df[chan_df["well_id"]==wid] if ("well_id" in chan_df.columns) else pd.DataFrame()
-                with cols[i%2]:
-                    if not mg_g.empty:
-                        fig,ax=plt.subplots(); ax.scatter(mg_g["MG_X"], mg_g["MG_Y"], s=10)
-                        ax.grid(True, alpha=0.3); ax.set_xlabel("X = Qt_cum/Qt_cum(T)"); ax.set_ylabel("Y = Qo_cum/Qt_cum")
-                        ax.set_title(f"MG — {wid}"); st.pyplot(fig)
-                    else: st.info("Нет данных MG")
-                    if not ch_g.empty:
+
+                # MG
+                with left:
+                    if not mg_g.empty and {"MG_X","MG_Y"}.issubset(mg_g.columns) and mg_g[["MG_X","MG_Y"]].dropna().shape[0] > 0:
+                        fig,ax=plt.subplots()
+                        ax.scatter(mg_g["MG_X"], mg_g["MG_Y"], s=10)
+                        ax.grid(True, alpha=0.3)
+                        ax.set_xlabel("X = Qt_cum/Qt_cum(T)")
+                        ax.set_ylabel("Y = Qo_cum/Qt_cum")
+                        ax.set_title(f"MG — {wid}")
+                        st.pyplot(fig)
+                    else:
+                        st.info("Нет пригодных точек для MG-графика")
+
+                # Chan
+                with right:
+                    needed = {"t_pos","WOR","dWOR_dt_pos"}
+                    if not ch_g.empty and needed.issubset(ch_g.columns) and ch_g[list(needed)].dropna(how="all").shape[0] > 0:
                         fig2,ax2=plt.subplots()
                         ax2.plot(ch_g["t_pos"], ch_g["WOR"], "o", markersize=3, label="WOR")
                         ax2.plot(ch_g["t_pos"], ch_g["dWOR_dt_pos"], "--", label="|dWOR/dt|")
-                        ax2.set_xscale("log"); ax2.set_yscale("log"); ax2.grid(True, which="both", alpha=0.3); ax2.legend()
-                        ax2.set_xlabel("t_pos (дни)"); ax2.set_ylabel("WOR, |dWOR/dt|"); ax2.set_title(f"Chan — {wid}")
+                        ax2.set_xscale("log"); ax2.set_yscale("log")
+                        ax2.grid(True, which="both", alpha=0.3); ax2.legend()
+                        ax2.set_xlabel("t_pos (дни)"); ax2.set_ylabel("WOR, |dWOR/dt|")
+                        ax2.set_title(f"Chan — {wid}")
                         st.pyplot(fig2)
-                    else: st.info("Нет данных Chan")
+                    else:
+                        st.info("Нет пригодных точек для Chan-графика")
 
         st.subheader("Скачать результаты")
         st.download_button("📥 Единый Excel (Summary, MG, Chan)", data=export_xlsx(mg_df, chan_df, summary),
