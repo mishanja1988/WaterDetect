@@ -13,7 +13,7 @@ import streamlit as st
 
 # ========= Константы / настройки =========
 EPS = 1e-9
-TEMPLATE_PATH = "data/templates/df_raw.xlsx"
+TEMPLATE_PATH = "data/templates/Сосновское_clean.xlsx"
 MIN_POINTS = 8
 SHARED_WATERCUT_THR = 0.02
 
@@ -438,4 +438,3 @@ if st.button("▶ Запустить расчёт"):
     )
 else:
     st.info("Нажмите «Запустить расчёт» — интерфейс уже готов, данные будут кэшироваться для повторных запусков.")
-
